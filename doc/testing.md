@@ -202,6 +202,22 @@ That requires the transport to be abstracted behind a trait rather than being HT
 This is a design constraint that should be honoured in the implementation: **the sync
 engine must not depend on axum.**
 
+### 16. Bulk apply
+
+- A 50,000-row batch applies without exceeding SQLite's bound-parameter limit.
+- The chunk size adapts to the column count: `rows × columns ≤ 32,766` for every chunk,
+  at several table widths.
+- A bulk apply is **atomic** — a failure part-way through leaves nothing applied, and
+  the `_sync_log` is consistent with the user table.
+- The LWW filter works in the upsert: an older incoming row does not overwrite a newer
+  one.
+- The digest tie-break is applied in Rust: an equal timestamp with a higher digest wins,
+  consistently on both peers.
+- All three bulk paths (chunked `VALUES`, JSON, staging table) produce identical
+  results.
+- The JSON path requires `FROM json_each(?1) AS j` and `WHERE true` before
+  `ON CONFLICT` — asserted, so a refactor cannot silently break it.
+
 ## Property tests elsewhere
 
 Beyond convergence:

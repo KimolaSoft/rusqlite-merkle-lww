@@ -28,6 +28,7 @@ without transferring rows that did not.
 | [doc/implementation.md](doc/implementation.md) | **For application developers** — how to wire the crate in |
 | [doc/architecture.md](doc/architecture.md) | Roles, topology, crate layout, threading, transport |
 | [doc/data-model.md](doc/data-model.md) | Schema, key strategies, visibility, encoding |
+| [doc/bulk-apply.md](doc/bulk-apply.md) | Bulk row application, parameter limits, chunking |
 | [doc/sqlite-interface.md](doc/sqlite-interface.md) | Triggers, authorizer, write dialects, DDL |
 | [doc/merkle.md](doc/merkle.md) | Buckets, hashing, comparison depth, snapshots |
 | [doc/protocol.md](doc/protocol.md) | Wire protocol, sessions, progress reporting |

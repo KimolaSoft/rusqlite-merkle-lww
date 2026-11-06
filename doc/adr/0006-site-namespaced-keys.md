@@ -1,4 +1,4 @@
-# ADR-0006: Site-namespaced keys
+# ADR-0006: Site-namespaced keys, with `GlobalId` as the default for shared datasets
 
 - **Status:** accepted
 - **Date:** 2026-11
@@ -29,79 +29,102 @@ The key question is what "uniqueness" means here. Two readings:
   end up as one row. Adding the site to the key does *not* achieve this; it deliberately
   prevents it.
 
+Initially this ADR chose site-namespacing as the default, on the reasoning that it is
+safe under every interpretation. That was revised once the deployment's actual shape was
+clarified:
+
+> For most cases, I think sites would be sharing one dataset, so the same user would be
+> the same user
+
+That is the **entity-merging** case. The default has changed accordingly.
+
 ## Decision
 
-**The site is part of the key. It is the conflict domain.**
+**The site is part of the key only when the sites own independent data.**
 
-Under the default `SiteNamespaced` strategy:
+Four strategies are supported, selected per table:
 
+```rust
+pub enum KeyStrategy {
+    SiteNamespaced { site_column: String, key_columns: Vec<String> },
+    GlobalId { key_columns: Vec<String> },
+    Surrogate { column: String },
+    Rowid,
+}
 ```
-key = (site, id)
-```
 
-The site is fixed at creation and never changes. Another site updating the row addresses
-the full key — including the original site — and the namespace does not change.
+**The default is `GlobalId`**, because the expected deployment is a shared dataset where
+the same user is the same user everywhere.
 
-Three alternative strategies are also supported, per table:
+`SiteNamespaced` remains available, and is the correct choice for tables that are
+genuinely per-site — multi-tenant data, or separately operated datasets where merging
+would be actively harmful.
 
-| Strategy | Cross-site merging | Requires |
-|---|---|---|
-| `SiteNamespaced` (default) | no | nothing |
-| `GlobalId` | **yes** | globally unique ids (UUIDv7, ULID, Snowflake) |
-| `Surrogate` | no | nothing; the crate adds its own key column |
-| `Rowid` | no | nothing |
+### The id must be deterministic
 
-The default is `SiteNamespaced` because it requires no coordination and makes the common
-case — each site owns its own data — trivially safe.
+`GlobalId` only merges if **both sites derive the same id** for the same entity. A
+randomly generated globally-unique id (UUIDv7, ULID) does not merge anything; it merely
+avoids collisions.
+
+For "the same user is the same user" to hold, the id must be:
+
+- derived deterministically from a natural key (`uuidv5(namespace, "user:alice")`), or
+- assigned by something upstream that already agrees across sites.
+
+This is stated prominently because it is the most common way a `GlobalId` deployment
+fails to behave as intended.
 
 ## Consequences
 
 **Positive**
 
-- **Conflict probability drops to nearly zero.** Two sites writing the same logical id
-  produce two different rows, which never contend. Genuine LWW conflicts occur only
-  *within* a site, where the participants share a clock budget and an operator.
-- **No coordination.** No ID allocator, no registry, no consensus. The site name is
-  configuration.
-- **Ownership is stable.** A row's site says who created it. Another site can modify it
-  — which is legitimate, and useful — without changing that.
-- **The merge rule stays simple.** LWW on `(last_update, digest)`, with no special case
-  for cross-site creation.
+- **The shared-dataset case works as intended.** Two sites updating the same user
+  converge on one row, and LWW resolves which write wins.
+- **The per-site case remains expressible.** A table of per-site data can use
+  `SiteNamespaced` without affecting the tables that should merge.
+- **The site becomes ordinary data** under `GlobalId` — a mutable column that records
+  where a row was last written, which is useful on its own.
+- **A single primary key strategy covers most deployments**, so the default rarely needs
+  to be overridden.
 
 **Negative**
 
-- **Independently-created entities at different sites do not merge.** If site A creates
-  "user alice" and site B also creates "user alice", there are two rows. This is
-  deliberate, but it must be understood by whoever uses the system, and it is the
-  principal surprise in the design.
-- **`site` must be a column.** Every synced table carries it, and it cannot be changed
-  without a move.
-- **Cross-site reads need the site.** A query for "user alice" must specify which site,
-  because there may be several.
+- **`GlobalId` requires a deterministic id**, which is a real constraint on the
+  application. Randomly generated ids must be replaced with derived ones, or the
+  deployment behaves differently from what it looks like.
+- **The two failure modes are asymmetric.** With `GlobalId` on independent data, two
+  unrelated records merge and one is silently lost to LWW — not recoverable. With
+  `SiteNamespaced` on shared data, two rows exist that should be one — recoverable by
+  deliberate reconciliation. The default follows the *expected* deployment rather than
+  the *safest* one, and that is a deliberate choice.
+- **`SiteNamespaced` users must address the full key** when updating a row created at
+  another site — the namespace is part of the key.
 
 **Neutral**
 
-- The namespace column is part of the primary key, so it is included in the digest and
-  in the canonical key encoding. Two rows differing only in site are genuinely different
-  rows and hash differently.
+- The namespace column is part of the primary key under `SiteNamespaced`, so it is
+  included in the digest and in the canonical key encoding. Two rows differing only in
+  site are genuinely different rows and hash differently.
+- The `site` column remains meaningful under `GlobalId` as an ordinary replicated
+  attribute.
 
 ## Alternatives considered
 
-**No namespace — plain application keys.** Rejected: two sites writing the same id
-contend directly, which is the high-multi-writer case LWW handles worst. This is
-exactly the problem the namespace exists to solve.
+**Site-namespacing as the default.** Initially chosen, and still the *safest* default,
+because it cannot merge unrelated records. Revised once it was clear that the sites
+share a dataset. It remains available per table.
 
-**A globally unique id generated by the application.** Supported as `GlobalId`. Rejected
-as the *default* because it requires every application to adopt an id scheme, and
-because it silently merges entities that may be genuinely distinct — a user created
-independently at two sites with the same UUID would be merged, which may be wrong.
+**No namespace at all — plain application keys.** Rejected: two sites writing the same
+id contend directly, which is the high-multi-writer case LWW handles worst. This is
+exactly the problem the strategies exist to solve.
+
+**A globally unique id generated locally.** Supported as `GlobalId`, but rejected as a
+*complete* answer without the determinism caveat: locally generated ids do not merge
+independently-created entities. They avoid collisions, which is a different property.
 
 **A surrogate key generated by the crate.** Supported as `Surrogate`. Rejected as the
-default because it adds a column the application did not ask for, and because it makes
-the application's own primary key no longer unique across sites.
-
-**Site as a mutable column rather than part of the key.** Rejected: then the site no
-longer namespaces anything, and two sites can write the same row — the problem returns.
+default because it adds a column the application did not ask for, and because a random
+surrogate does not merge across sites either — it is `SiteNamespaced` with extra steps.
 
 **Allow the site to change on a move.** Rejected: it would mean a key change, which is
 already handled by `move_key`. There is no reason to make it a special case.

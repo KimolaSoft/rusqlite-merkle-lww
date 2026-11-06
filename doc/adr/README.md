@@ -18,7 +18,7 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | [0003](0003-absolute-bucket-boundaries.md) | Absolute epoch-anchored bucket boundaries, not rolling tiers | accepted |
 | [0004](0004-digest-is-always-computed-and-keyed.md) | The digest is always computed, and keyed | accepted |
 | [0005](0005-soft-deletes-with-a-shared-purge-schedule.md) | Soft deletes with a shared purge schedule | accepted |
-| [0006](0006-site-namespaced-keys.md) | Site-namespaced keys; the site is the conflict domain | accepted |
+| [0006](0006-site-namespaced-keys.md) | Site-namespaced keys, with `GlobalId` as the default for shared datasets | accepted |
 | [0007](0007-config-is-a-library-type.md) | Config is a serde struct, not a file format | accepted |
 | [0008](0008-two-peer-identity-layers.md) | Peer identity is a stable id plus a separate credential | accepted |
 | [0009](0009-progress-has-no-eta.md) | Progress is X-of-Y; no ETA in the protocol | accepted |

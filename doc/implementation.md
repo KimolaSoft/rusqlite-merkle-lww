@@ -58,9 +58,8 @@ let config = SyncConfig {
 let spec = TableSpec {
     name: "device".into(),
     kind: TableKind::Keyed,
-    key: KeyStrategy::SiteNamespaced {
-        site_column: "sync_ns".into(),
-        key_columns: vec!["id".into()],
+    key: KeyStrategy::GlobalId {
+        key_columns: vec!["id".into()],     // must be globally unique across sites
     },
     columns: vec![
         ColumnSpec { name: "payload".into(), replicated: true,  visibility: Visibility::Public },
@@ -69,6 +68,13 @@ let spec = TableSpec {
     client_visible: true,
 };
 ```
+
+**For the id to merge across sites, it must be the same id everywhere.** A randomly
+generated UUIDv7 at each site produces two different rows for the same user. Use a
+deterministic id — derived from a natural key, or issued by whatever already agrees
+across sites. See [data-model.md](data-model.md) § "Getting the id right".
+
+For a table whose rows are genuinely per-site, use `SiteNamespaced` instead.
 
 ### 3. Open the store
 
@@ -81,8 +87,8 @@ db.migrate()?;                 // create or adopt the managed tables
 
 ```rust
 let conn = db.conn()?;                        // pooled, instrumented
-conn.execute("INSERT INTO device(sync_ns, id, payload) VALUES (?1, ?2, ?3)",
-             params!["eu-west", "abc", "v1"])?;
+conn.execute("INSERT INTO device(id, payload) VALUES (?1, ?2)",
+             params!["abc", "v1"])?;
 ```
 
 **This is the important part.** The connection must come from `Db::conn()`, or from a
@@ -141,11 +147,11 @@ To import, write the value you want. To update, omit the column:
 
 ```sql
 -- Good: the crate stamps this.
-UPDATE device SET payload = 'v2' WHERE sync_ns = ?1 AND id = ?2;
+UPDATE device SET payload = 'v2' WHERE id = ?1;
 
 -- Only when importing historical data, where the timestamp is the point:
 UPDATE device SET payload = 'v2', last_update = '2024-01-01T00:00:00.000000Z'
- WHERE sync_ns = ?1 AND id = ?2;
+ WHERE id = ?1;
 ```
 
 ### Do not write the managed columns

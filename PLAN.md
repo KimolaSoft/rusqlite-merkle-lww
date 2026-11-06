@@ -166,6 +166,8 @@ verified experimentally rather than documented (see
 - The row-level diff in both modes: `digest` (compact) and `row` (simple).
 - `session.rs`: the protocol state machine, transport-independent.
 - Canonical serialisation of rows for the wire.
+- `bulk.rs`: the bulk apply path — chunked multi-row `VALUES`, the JSON bulk path, and
+  the staging-table path. See [doc/bulk-apply.md](doc/bulk-apply.md).
 
 ### Notes
 
@@ -174,6 +176,16 @@ verified experimentally rather than documented (see
 - The merge must be idempotent: applying the same row twice is a no-op.
 - A deleted row is an ordinary row. No special case in the diff, the merge, or the
   serialisation.
+- **Bulk apply must respect the 32,766 bound-parameter limit.** The chunk size is
+  derived from the column count, not hardcoded: `rows × columns ≤ 32,766`. A wide table
+  chunks smaller automatically. The limit cannot be raised at runtime — it is a
+  compile-time ceiling in SQLite.
+- The LWW filter is expressible in the upsert itself
+  (`ON CONFLICT … DO UPDATE … WHERE excluded.last_update > device.last_update`), but the
+  digest tie-break is applied in Rust, so the existing rows for a batch's keys are read
+  once and compared in memory before the upsert.
+- Bulk apply and the `_sync_log` update happen in the same transaction, so the log and
+  the user table cannot diverge.
 
 ### Exit criteria
 
@@ -182,8 +194,12 @@ verified experimentally rather than documented (see
   payloads converge on the same winner.
 - Suite 9 (divergence detection) passes: an out-of-band edit is detected and reported.
 - Applying a row updates the user table, `_sync_log` and the tree in one transaction.
+- **A 50,000-row batch applies without exceeding the parameter limit**, and the chunk
+  size adapts to the column count. Measured reference: ~95 ms for 50,000 rows via
+  chunked `VALUES`, ~108 ms via the JSON path.
+- A bulk apply is atomic: a failure part-way through leaves nothing applied.
 
-**Test suites:** 1, 8, 9.
+**Test suites:** 1, 8, 9, plus the bulk-apply suite.
 
 ---
 
@@ -337,7 +353,7 @@ These are unresolved, and the ones marked **blocking** hold up a specific phase.
 |---|---|---|---|
 | 1 | **Default write dialect.** Enforced (UDF triggers) or compatible (pure-SQL staging)? | Determines whether the application can use `Db::conn()` at all | Phase 1 |
 | 2 | ~~Does the crate terminate TLS?~~ | **Resolved: no.** The crate has no TLS dependency. The application terminates TLS and handles authentication; the crate provides the exchange and the peer check. See [doc/implementation.md](doc/implementation.md) | — |
-| 3 | **`GlobalId` or `SiteNamespaced` as the default key strategy?** | Whether cross-site entities merge | Phase 0 |
+| 3 | ~~`GlobalId` or `SiteNamespaced` as the default key strategy?~~ | **Resolved: `GlobalId` default.** The sites share one dataset, so the same user is the same user. `SiteNamespaced` remains available per table for genuinely per-site data. See [ADR-0006](doc/adr/0006-site-namespaced-keys.md) | — |
 | 4 | **How is the digest seed distributed?** Environment variable, mounted secret, or KMS. The crate stores it but does not implement a secret store. | Deployment; not implementation | — |
 | 5 | **Wire format.** JSON, or binary from the start? | Protocol stability | Phase 4 |
 | 6 | **Is the purge period daily, or aligned to the retention window?** Daily gives predictable instants; aligned to retention makes tombstones live exactly 30 days. | Purge cadence | Phase 5 |
@@ -397,54 +413,30 @@ the crate?* If yes, enforced. If no, compatible, and the gap is accepted knowing
 
 ### Question 3, elaborated — the key strategy
 
-The question is:
-
 > **When two sites create what should be the same logical entity, do they become one row
 > or two?**
 
-`SiteNamespaced` makes the key `(site, id)`. `GlobalId` makes the key `(id)`, where the
-id is globally unique.
+**Resolved: `GlobalId` as the default.** The sites share one dataset, so the same user
+is the same user everywhere, and two sites updating that user should converge on one row.
 
-**The practical difference.** Two sites independently create "user alice":
+The consequence that must be handled explicitly: **`GlobalId` only merges if both sites
+derive the same id.** A randomly generated globally-unique id (UUIDv7, ULID, Snowflake)
+does not merge anything — it merely avoids collisions. For "the same user is the same
+user" to hold, the id must be:
 
-| | `SiteNamespaced` | `GlobalId` |
-|---|---|---|
-| Rows created | `(eu-west, alice)` and `(tokyo, alice)` | one row, if both sites derive the same id |
-| After a sync | two rows, both present | one row; LWW picks the winner |
-| Merge conflict | none | resolved by `last_update` |
-| Coordination needed | none | a globally unique id scheme |
+- derived deterministically from a natural key — `uuidv5(namespace, "user:alice")`; or
+- assigned by something upstream that already agrees across sites.
 
-**The cases.**
+The crate should offer a `Surrogate` variant that derives a deterministic UUIDv5 from the
+table's natural key columns, so an application can opt into merging without changing its
+schema.
 
-1. **Each site owns its own data.** Site A's "alice" and Site B's "alice" are genuinely
-   different people or different records. This is the multi-tenant or
-   independently-operated case. `SiteNamespaced` is **correct** — and `GlobalId` would be
-   actively harmful, merging two customers' records into one row and letting LWW pick a
-   winner.
+`SiteNamespaced` stays available per table for data that is genuinely per-site — where
+merging two records would be actively harmful.
 
-2. **Sites are replicas of one logical dataset.** "Alice" means the same person
-   everywhere, and the sites should converge on one record. `GlobalId` is correct, and it
-   requires an id that both sites derive identically — a UUIDv5 of a natural key, or a
-   server-issued id.
+See [doc/data-model.md](doc/data-model.md) § "Key strategies" and
+[ADR-0006](doc/adr/0006-site-namespaced-keys.md).
 
-3. **Each site owns its data but must report across sites.** A reporting query needs to
-   see all rows. `SiteNamespaced` handles this: the query spans sites, and there is no
-   conflict to resolve. This is the case the multi-master mesh in
-   [doc/architecture.md](doc/architecture.md) is built for.
-
-**Recommendation.** Default to **`SiteNamespaced`**, on the grounds that it is safe under
-cases 1 and 3, and that case 2 is the only one where merging is wanted — and case 2 is
-also the case where a globally unique id is *most* work, because it needs a shared id
-derivation scheme.
-
-The cost of being wrong: under case 2 with `SiteNamespaced`, the same logical entity
-exists as two rows that never merge, and reconciliation has to be done deliberately. That
-is recoverable. Under case 1 with `GlobalId`, two unrelated records are merged and one is
-silently lost to LWW. That is not recoverable, which is why `SiteNamespaced` is the safer
-default.
-
-**The question to answer:** *are the sites independent (case 1 or 3), or replicas of one
-dataset (case 2)?*
 
 ---
 
@@ -458,3 +450,6 @@ dataset (case 2)?*
 | The digest or encoding changes after data exists | Low | Both are versioned in `_sync_meta`; the crate refuses to start with a changed version unless told to re-digest |
 | Clock skew beyond the documented ±1 s | Medium | A skew check at handshake; peers believed to be skewed are refused |
 | The month tier's memory grows unexpectedly | Low | Bounded by activity, not age; `max_tree_buckets` is a tripwire |
+| A bulk apply exceeds SQLite's 32,766 bound-parameter limit | Medium | The chunk size is derived from the column count, and the JSON path uses a single parameter regardless of batch size. A 50,000-row batch is covered by a test |
+| The application generates random ids where deterministic ones were needed, so rows never merge | Medium | Documented prominently in the key-strategy section and ADR-0006; `verify` can report entities that exist at more than one site with the same natural key |
+| A site uses `GlobalId` on data that is genuinely per-site, and two records merge | Low | `SiteNamespaced` is a per-table option; the failure is data loss, so the default should be reviewed when the deployment shape changes |

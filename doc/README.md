@@ -25,6 +25,12 @@ What is stored. The managed columns every synced table carries, the four key str
 the visibility model for restricted columns, the internal `_sync_*` tables, and the
 canonical encoding used for hashing.
 
+### [bulk-apply.md](bulk-apply.md)
+
+How many rows are applied at once. The three bulk paths, SQLite's 32,766 bound-parameter
+limit and how the chunk size is derived, and how the last-write-wins filter is expressed
+in the upsert itself.
+
 ### [sqlite-interface.md](sqlite-interface.md)
 
 How the crate interacts with SQLite. The trigger set, the authorizer rules, the two
@@ -86,7 +92,7 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | [0003](adr/0003-absolute-bucket-boundaries.md) | Absolute epoch-anchored bucket boundaries, not rolling tiers |
 | [0004](adr/0004-digest-is-always-computed-and-keyed.md) | The digest is always computed, and keyed |
 | [0005](adr/0005-soft-deletes-with-a-shared-purge-schedule.md) | Soft deletes purged on a globally scheduled instant |
-| [0006](adr/0006-site-namespaced-keys.md) | Site-namespaced keys; the site is the conflict domain |
+| [0006](adr/0006-site-namespaced-keys.md) | Site-namespaced keys, with `GlobalId` as the default for shared datasets |
 | [0007](adr/0007-config-is-a-library-type.md) | Config is a serde struct, not a file format |
 | [0008](adr/0008-two-peer-identity-layers.md) | Peer identity is a stable id plus a separate credential |
 | [0009](adr/0009-progress-has-no-eta.md) | Progress is X-of-Y; no ETA in the protocol |
@@ -117,7 +123,7 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | **purge instant** | The globally scheduled moment at which tombstones are removed |
 | **absence** | A key not present in `_sync_log` — either never existed, or purged |
 | **staleness horizon** | How long a peer may be offline before it must re-seed rather than sync incrementally |
-| **site** | A deployment location; part of the key, and the conflict domain |
+| **site** | A deployment location. Part of the key under the `SiteNamespaced` strategy; an ordinary column under `GlobalId` |
 | **digest seed** | The deployment secret the digest is keyed with; shared by trusted peers, absent from clients |
 
 ## Status of this documentation

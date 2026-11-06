@@ -54,15 +54,25 @@ machinery, and because they are the case where a wrong answer is most visible.
 ### Multi-master and the conflict domain
 
 Masters in different sites replicate to each other, which means two sites can write to
-the same table. The design makes that safe by making the **site part of the key**: a row
-authored at `eu-west` is keyed `(eu-west, id)`, and a row authored at `tokyo` with the
-same `id` is a *different row*. The two never contend.
+the same table.
 
-The consequence, stated plainly: **the same logical entity created independently at two
-sites does not merge.** It becomes two rows. That is deliberate — see
-[ADR-0006](adr/0006-site-namespaced-keys.md). If a deployment needs cross-site merging of
-independently-created entities, the `GlobalId` key strategy is the alternative, and it
-requires globally unique identifiers.
+The expected deployment is a **shared dataset**: the sites are peers over one logical
+dataset, so the same user is the same user everywhere. Under the default `GlobalId` key
+strategy, two sites updating the same user converge on **one row**, and LWW resolves
+which write wins.
+
+The caveat that must be handled explicitly: this only works if both sites derive the
+**same id** for the same entity. A randomly generated globally-unique id does not merge
+anything — it merely avoids collisions. See
+[data-model.md](data-model.md) § "Getting the id right".
+
+For tables that are genuinely per-site, the `SiteNamespaced` strategy keeps each site's
+rows in its own namespace. Those rows never contend, which is the safe behaviour for
+data that must not be blended across sites.
+
+Both strategies are available per table. The choice is a data-modelling decision, and
+the default follows the expected deployment — see
+[ADR-0006](adr/0006-site-namespaced-keys.md).
 
 ## Transport
 
