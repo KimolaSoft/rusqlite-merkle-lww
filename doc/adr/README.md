@@ -23,6 +23,7 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | [0008](0008-two-peer-identity-layers.md) | Peer identity is a stable id plus a separate credential | accepted |
 | [0009](0009-progress-has-no-eta.md) | Progress is X-of-Y; no ETA in the protocol | accepted |
 | [0010](0010-no-orm-query-wrapper.md) | No ORM; the crate owns the connection, not the query language | accepted |
+| [0011](0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport | accepted |
 
 ## Status values
 

@@ -189,15 +189,20 @@ verified experimentally rather than documented (see
 
 ## Phase 4 — Transport
 
-**Goal.** The protocol over HTTP and WebSocket.
+**Goal.** The protocol over HTTP and WebSocket, as an optional convenience over a
+transport-agnostic core.
 
 ### Deliverables
 
-- `merkle-lww-axum`: the REST endpoints and the WebSocket handler.
+- The core's transport-agnostic exchange: `perform_exchange(peer, transport)`, where
+  `transport` carries request and response messages. The session state machine must not
+  know about HTTP.
+- `merkle-lww-axum`: the REST endpoints and the WebSocket handler, built on the core.
 - Sessions: opaque `session_id`, in-memory, five-minute TTL.
 - The handshake and its validation.
 - The progress model: `SyncProgress`, the endpoints, the WS frame.
 - Auth: the peer list check and the credential check.
+- `doc/implementation.md`, covering the integration for application developers.
 
 ### Notes
 
@@ -206,6 +211,10 @@ verified experimentally rather than documented (see
 - `as_of_us` is server-supplied in a client→server session, so both sides choose
   identical comparison depths.
 - Progress frames are throttled to 250 ms and only sent when `completed` advances.
+- **The crate does not terminate TLS.** The application does, and handles authentication.
+  The crate's own axum crate assumes TLS is terminated in front of it.
+- The core's transport abstraction is what lets the convergence test drive several nodes
+  in one process. It is a testability requirement as much as an extensibility one.
 
 ### Exit criteria
 
@@ -215,6 +224,7 @@ verified experimentally rather than documented (see
   phases.
 - Every handshake rejection case returns the documented error code.
 - The pull-only client flow works: the server pushes the diff, the client applies it.
+- The core has no dependency on axum, and the exchange works over a non-HTTP transport.
 
 **Test suites:** 12, 15.
 
@@ -325,17 +335,116 @@ These are unresolved, and the ones marked **blocking** hold up a specific phase.
 
 | # | Question | Impact | Blocking |
 |---|---|---|---|
-| 1 | **Default write dialect.** Enforced (UDF triggers) is recommended, but an application that insists on its own `rusqlite::Connection` can only use compatible mode, with drain latency. | Determines whether the target application can use `Db::conn()` at all | Phase 1 |
-| 2 | **Does the crate terminate TLS, or assume a proxy?** Assuming a proxy keeps `rustls` out of the dependency list; terminating it enables `PeerAuth::ClientCert`. | Dependency list; the `PeerAuth` variants that make sense | Phase 4 |
-| 3 | **`GlobalId` or `SiteNamespaced` as the default key strategy?** `SiteNamespaced` requires no coordination but does not merge independently-created entities across sites. | Whether cross-site entities merge | Phase 0 |
+| 1 | **Default write dialect.** Enforced (UDF triggers) or compatible (pure-SQL staging)? | Determines whether the application can use `Db::conn()` at all | Phase 1 |
+| 2 | ~~Does the crate terminate TLS?~~ | **Resolved: no.** The crate has no TLS dependency. The application terminates TLS and handles authentication; the crate provides the exchange and the peer check. See [doc/implementation.md](doc/implementation.md) | — |
+| 3 | **`GlobalId` or `SiteNamespaced` as the default key strategy?** | Whether cross-site entities merge | Phase 0 |
 | 4 | **How is the digest seed distributed?** Environment variable, mounted secret, or KMS. The crate stores it but does not implement a secret store. | Deployment; not implementation | — |
 | 5 | **Wire format.** JSON, or binary from the start? | Protocol stability | Phase 4 |
 | 6 | **Is the purge period daily, or aligned to the retention window?** Daily gives predictable instants; aligned to retention makes tombstones live exactly 30 days. | Purge cadence | Phase 5 |
 | 7 | **Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?** Only staged rows, presumably, but a row written and deleted within one interval is lost — acceptable, since it was never visible to a peer. | Drain semantics | Phase 1 |
 | 8 | **Should `AppendOnly` tables exist?** They remove the delete machinery from the trigger set, at the cost of a second code path. | Scope of the trigger set | Phase 1 |
 
-Questions 1, 2 and 3 are the ones that change the shape of the code. The rest can be
-settled during the phase they affect.
+Questions 1 and 3 change the shape of the code. The rest can be settled during the phase
+they affect.
+
+### Question 1, elaborated — the write dialect
+
+The question is not "does the application use `rusqlite`?" It is:
+
+> **Does the application open connections the crate did not instrument?**
+
+That determines whether the crate's write-time invariants can be enforced at all.
+
+**How the invariant is enforced.** Every write to a managed table must (a) stamp
+`last_update` and (b) update `_sync_log`. Doing that in Rust means the trigger calls a
+Rust function — the digest is xxh3, which SQLite does not have.
+
+- **Enforced.** The trigger calls `sync_stamp()` and `sync_digest()`, registered on the
+  connection by the crate. The work happens inside the write transaction, so the log is
+  never stale. On a connection without the functions registered, the write **fails** with
+  `no such function: sync_stamp`.
+- **Compatible.** The trigger stages the row into a table using pure SQL, and a Rust
+  drainer computes the digest afterwards. Works on any connection. Costs up to one drain
+  interval of latency, and millisecond rather than microsecond timestamp resolution.
+
+**What it means in practice.**
+
+| Application | Enforced | Compatible |
+|---|---|---|
+| Uses `rusqlite`, takes connections from `Db::conn()` | **yes, recommended** | works, with latency |
+| Uses `rusqlite`, opens its own connections | no — needs the connection factory | works |
+| Uses `diesel` | no — diesel opens its own connections | works |
+| Uses `sqlx` | no | works |
+| Uses the `sqlite3` CLI | no | works, but only for reads |
+
+**The compatibility gap, verified.** The authorizer is per-connection, so in compatible
+mode a foreign connection has no denial rules. It can write `_sync_log` and hard-delete
+managed rows. Two pure-SQL guards close the important cases: a `BEFORE DELETE` trigger
+converts a hard delete into a soft delete, and a guard trigger rejects writes to the
+internal log. The remaining gap is that a foreign connection can write `status` or
+`purge_on` directly. That is caught and propagated, but the tombstone deadline may be
+inconsistent. See [doc/sqlite-interface.md](doc/sqlite-interface.md) § "Compatible mode and
+foreign connections".
+
+**Recommendation.** Default to **enforced**, and document that the application must use
+`Db::conn()` or the crate's connection factory. The failure mode for a misconfigured
+application is a loud error at the first write, not silent divergence. If the target
+application genuinely cannot be changed, compatible mode is the fallback and the
+documented gaps apply.
+
+**The question to answer:** *can the application be changed to take its connections from
+the crate?* If yes, enforced. If no, compatible, and the gap is accepted knowingly.
+
+### Question 3, elaborated — the key strategy
+
+The question is:
+
+> **When two sites create what should be the same logical entity, do they become one row
+> or two?**
+
+`SiteNamespaced` makes the key `(site, id)`. `GlobalId` makes the key `(id)`, where the
+id is globally unique.
+
+**The practical difference.** Two sites independently create "user alice":
+
+| | `SiteNamespaced` | `GlobalId` |
+|---|---|---|
+| Rows created | `(eu-west, alice)` and `(tokyo, alice)` | one row, if both sites derive the same id |
+| After a sync | two rows, both present | one row; LWW picks the winner |
+| Merge conflict | none | resolved by `last_update` |
+| Coordination needed | none | a globally unique id scheme |
+
+**The cases.**
+
+1. **Each site owns its own data.** Site A's "alice" and Site B's "alice" are genuinely
+   different people or different records. This is the multi-tenant or
+   independently-operated case. `SiteNamespaced` is **correct** — and `GlobalId` would be
+   actively harmful, merging two customers' records into one row and letting LWW pick a
+   winner.
+
+2. **Sites are replicas of one logical dataset.** "Alice" means the same person
+   everywhere, and the sites should converge on one record. `GlobalId` is correct, and it
+   requires an id that both sites derive identically — a UUIDv5 of a natural key, or a
+   server-issued id.
+
+3. **Each site owns its data but must report across sites.** A reporting query needs to
+   see all rows. `SiteNamespaced` handles this: the query spans sites, and there is no
+   conflict to resolve. This is the case the multi-master mesh in
+   [doc/architecture.md](doc/architecture.md) is built for.
+
+**Recommendation.** Default to **`SiteNamespaced`**, on the grounds that it is safe under
+cases 1 and 3, and that case 2 is the only one where merging is wanted — and case 2 is
+also the case where a globally unique id is *most* work, because it needs a shared id
+derivation scheme.
+
+The cost of being wrong: under case 2 with `SiteNamespaced`, the same logical entity
+exists as two rows that never merge, and reconciliation has to be done deliberately. That
+is recoverable. Under case 1 with `GlobalId`, two unrelated records are merged and one is
+silently lost to LWW. That is not recoverable, which is why `SiteNamespaced` is the safer
+default.
+
+**The question to answer:** *are the sites independent (case 1 or 3), or replicas of one
+dataset (case 2)?*
 
 ---
 

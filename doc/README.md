@@ -7,10 +7,17 @@ made along the way.
 
 ## The documents
 
+### [implementation.md](implementation.md)
+
+**Start here if you are building an application on this crate.** What the crate
+provides, what it expects from you, how to wire it in, and the integration mistakes that
+cause divergence rather than errors.
+
 ### [architecture.md](architecture.md)
 
 The shape of the system: roles (master / child / client), the peer topology, the crate
-layout, the threading model, and how the pieces fit together.
+layout, the threading model, the division of transport responsibility, and how the
+pieces fit together.
 
 ### [data-model.md](data-model.md)
 

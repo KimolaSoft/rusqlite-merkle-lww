@@ -25,7 +25,8 @@ without transferring rows that did not.
 | Document | What it covers |
 |---|---|
 | [doc/README.md](doc/README.md) | Index, glossary, conventions |
-| [doc/architecture.md](doc/architecture.md) | Roles, topology, crate layout, threading |
+| [doc/implementation.md](doc/implementation.md) | **For application developers** — how to wire the crate in |
+| [doc/architecture.md](doc/architecture.md) | Roles, topology, crate layout, threading, transport |
 | [doc/data-model.md](doc/data-model.md) | Schema, key strategies, visibility, encoding |
 | [doc/sqlite-interface.md](doc/sqlite-interface.md) | Triggers, authorizer, write dialects, DDL |
 | [doc/merkle.md](doc/merkle.md) | Buckets, hashing, comparison depth, snapshots |

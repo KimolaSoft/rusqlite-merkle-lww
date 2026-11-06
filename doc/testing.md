@@ -54,6 +54,21 @@ point of the design.
 - A row written and deleted within one drain interval is missed in compatible mode —
   asserted, so the behaviour is documented rather than incidental.
 
+**The compatible-dialect guarantees**, each asserted from a *foreign* connection with no
+authorizer installed:
+
+- A hard `DELETE` of a live row is **converted to a soft delete** — the row survives with
+  `status = 'deleted'`, and the tombstone is staged.
+- A hard `DELETE` of an existing tombstone is **blocked**; the row survives.
+- A write to `_sync_log` is **rejected** by the log guard.
+- The crate's own purge — with the guard marker set — **does** remove the row physically.
+- A write to `status` or `purge_on` **succeeds** (the documented gap). Asserted, so the
+  gap is documented rather than incidental.
+
+The last assertion matters as much as the others: a test that asserts the *absence* of a
+guarantee will fail loudly if someone later adds a guard, prompting them to update the
+documentation rather than silently changing the contract.
+
 ### 5. Resurrection
 
 - A deletes K. B is offline before the delete. B returns after the purge instant.

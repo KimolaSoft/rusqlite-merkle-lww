@@ -233,9 +233,10 @@ by a background task.
 | Extra machinery | none | staging table + drainer |
 | Timestamp resolution | microseconds | milliseconds |
 | A row written and deleted within one drain interval | captured | **missed** |
+| Authorizer rules enforced on foreign connections | n/a (writes fail anyway) | **no** — see below |
 
-The last row is acceptable: such a row was never visible to any peer, so missing it
-changes nothing.
+The last row is a real difference, and it is the substance of the dialect choice. See
+"Compatible mode and foreign connections" below.
 
 ### Choosing
 
@@ -244,12 +245,87 @@ The dialect is a deployment decision, configured per node.
 - **Enforced** — recommended. Correctness by construction; a misconfigured application
   fails loudly rather than diverging silently.
 - **Compatible** — for applications that must use their own `rusqlite::Connection` and
-  cannot be changed. Costs drain latency and the digest is not computed in the write
+  cannot be changed. Costs drain latency, and the digest is not computed in the write
   transaction.
 
 A middle ground exists: the crate provides a `rusqlite::Connection` factory that
 registers the UDFs, so an application that *wants* its own connection can have one and
-still get the strict guarantees. This is the recommended way to use enforced mode.
+still get the strict guarantees. This is the recommended way to use enforced mode, and it
+is the answer for an application that uses `rusqlite` but manages its own pool.
+
+The practical question is not "does the application use `rusqlite`?" — it is "does the
+application open connections the crate did not instrument?" An application using
+`rusqlite` but taking connections from `Db::conn()` is fine under enforced mode. An
+application using `diesel`, `sqlx`, or the `sqlite3` CLI is not, because those open
+their own connections and cannot register the crate's UDFs.
+
+### Compatible mode and foreign connections
+
+In compatible mode the triggers are pure SQL, so they fire on **any** connection. But the
+**authorizer is per-connection**, so a foreign connection has none of the denial rules.
+This was verified, and the results are:
+
+| Action from a foreign connection | Enforced | Compatible |
+|---|---|---|
+| `INSERT` / `UPDATE` a managed table | **fails** (no such function) | **allowed**, staged |
+| `DELETE` a live row | **fails** | **allowed** — but converted to a soft delete (§ below) |
+| `DELETE` a tombstone | **fails** | **blocked** by the delete guard |
+| Write to `_sync_log` | **fails** | **blocked** by the log guard |
+| Write `status` or `purge_on` | **fails** | **allowed** — a known gap |
+
+Two of these gaps are closed with **data-level guards**, which are pure SQL and therefore
+apply to every connection:
+
+**The delete guard.** A `BEFORE DELETE` trigger converts a hard delete into a soft
+delete, and aborts the statement:
+
+```sql
+CREATE TRIGGER sync_device_bd BEFORE DELETE ON device
+WHEN NOT EXISTS (SELECT 1 FROM _sync_purge_armed WHERE tbl = 'device')
+BEGIN
+    UPDATE device SET status = 'deleted',
+        purge_on = strftime('%Y-%m-%dT%H:%M:%f','now') || '000Z'
+        WHERE rowid = OLD.rowid;
+    SELECT RAISE(IGNORE);          -- skip the physical delete
+END;
+```
+
+The `_sync_purge_armed` marker table lives in the **main** database, not `temp` —
+triggers cannot reference `temp` objects, which was verified (`triggers cannot reference
+objects in database temp`). The crate sets the marker immediately around its own purge
+statement, so the legitimate physical delete still works.
+
+**The log guard.** The same technique protects the internal tables:
+
+```sql
+CREATE TRIGGER sync_log_guard BEFORE INSERT ON _sync_log
+WHEN NOT EXISTS (SELECT 1 FROM _sync_drain_armed)
+BEGIN
+    SELECT RAISE(ABORT, 'internal table');
+END;
+```
+
+Both guards are strictly stronger than the authorizer for these two cases, because they
+hold regardless of which connection issued the statement. The authorizer remains the
+primary mechanism, because it covers a wider set of actions.
+
+**The remaining gap.** A foreign connection in compatible mode can write `status` or
+`purge_on` directly, because the authorizer is not present to deny it. Such a write is
+caught by the AFTER UPDATE trigger and staged, so the change *propagates* — but the
+application has bypassed the crate's soft-delete path, and the resulting tombstone may
+have an inconsistent `purge_on`.
+
+This is acceptable because it requires the application to deliberately write a
+crate-managed column, which is already documented as forbidden, and the consequence is a
+possibly-wrong tombstone deadline rather than silent divergence. It is **not** acceptable
+in enforced mode, which is one more reason enforced mode is the default.
+
+A foreign connection can also forge the guard markers, since it can write any table.
+That is a deliberate trade-off: the markers are an integrity mechanism against accidents,
+not an authentication mechanism. A hostile application with filesystem access to the
+database can corrupt it regardless — the database file is not a trust boundary against
+someone who can open it.
+
 
 ## Monotonic issuance
 
@@ -337,11 +413,16 @@ assumed. These results are the basis for the design.
 | 9 | Does `unixepoch('now','subsec')` give sub-second precision? | Milliseconds only. **Not** microseconds. A pure-SQL trigger must pad (`strftime(...) \|\| '000' \|\| 'Z'`), yielding a valid fixed-width timestamp at ms resolution. |
 | 10 | Is `sha3()` available in bundled SQLite? | **No.** It cannot stand in for the digest in a pure-SQL trigger; the digest must be computed in Rust, or the row staged for the drainer. |
 | 11 | Do the two dialects produce *comparable* timestamps? | **Yes.** The UDF path yields `…302238Z` and the padded pure-SQL path yields `…302000Z` — both exactly 27 characters, so they stay fixed-width and lexicographically comparable. Only the resolution differs. |
+| 12 | Does the authorizer apply to a foreign connection? | **No.** The authorizer is per-connection, so a foreign connection has none of the denial rules. Verified: a foreign connection can write `_sync_log` and hard-delete managed rows under the compatible dialect. |
+| 13 | Can a trigger's `WHEN` clause reference a `temp` table? | **No.** `triggers cannot reference objects in database temp`. A guard marker must live in the main database. |
+| 14 | Can a `BEFORE DELETE` trigger convert a hard delete into a soft delete? | **Yes.** `UPDATE` the row to `status='deleted'`, then `SELECT RAISE(IGNORE)` to skip the physical delete. The statement succeeds; the row survives as a tombstone. |
+| 15 | Can the same trigger let the crate's legitimate purge through? | **Yes.** Gate the `WHEN` clause on a main-database marker table that the crate sets around its own purge statement. Verified: an app hard-delete is converted to a soft delete, a second app hard-delete of the tombstone is blocked, and the crate's purge removes the row. |
 
 Consequences that follow directly:
 
 - The **authorizer is the enforcement primitive**, not a convenience. It is the only
-  thing standing between the application and the internal tables.
+  thing standing between the application and the internal tables — on the connections it
+  is installed on.
 - The **`accessor` exemption is load-bearing** (row 2).
 - **Enforced mode cannot support a foreign connection** (row 7). This is a feature
   (fail-closed) and a hard deployment constraint, which is why the staging dialect
@@ -350,6 +431,12 @@ Consequences that follow directly:
   *must* stage rows for a Rust drainer. It cannot be made synchronous.
 - The two dialects stay **wire-compatible** (row 11), so a deployment can mix enforced and
   compatible nodes without a timestamp-format fork.
+- **The authorizer is per-connection** (row 12), so compatible mode needs the data-level
+  guards to hold on foreign connections. The guards are pure SQL and therefore apply
+  everywhere.
+- **Guard markers must live in the main database** (row 13), not `temp`.
+- The **delete guard** (rows 14–15) makes a hard delete impossible from any connection in
+  compatible mode, which is the strongest form of the invariant.
 
 ## Related documents
 

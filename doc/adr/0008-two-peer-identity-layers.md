@@ -65,6 +65,9 @@ consuming application.
 
 The crate authenticates the peer with whatever credential the deployment already has.
 
+See [ADR-0011](0011-crate-provides-the-exchange.md) for the full division of
+responsibility between the crate and the application.
+
 ## Consequences
 
 **Positive**
@@ -126,3 +129,4 @@ decision is only that the *crate* does not take on that dependency.
 - [../security.md](../security.md) — the full trust model
 - [../protocol.md](../protocol.md) — handshake validation
 - [../config.md](../config.md) — the peer list
+- [ADR-0011](0011-crate-provides-the-exchange.md) — the crate/application division

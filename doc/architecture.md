@@ -64,6 +64,61 @@ sites does not merge.** It becomes two rows. That is deliberate — see
 independently-created entities, the `GlobalId` key strategy is the alternative, and it
 requires globally unique identifiers.
 
+## Transport
+
+**The crate does not implement TLS, and it does not dictate how the application exposes
+sync over the network.** It provides the data exchange; the application supplies the
+transport.
+
+This is a deliberate division, and it is the reason the crate can be used from any web
+framework:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Application                                                │
+│    • chooses REST, WebSocket, or both                       │
+│    • terminates TLS (or delegates it to a proxy)            │
+│    • authenticates the peer                                 │
+│    • calls the crate to perform the exchange                │
+└───────────────────────────┬─────────────────────────────────┘
+                            │  a transport-agnostic call
+┌───────────────────────────▼─────────────────────────────────┐
+│  merkle-lww-core                                            │
+│    perform_exchange(peer, transport) -> SyncReport          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The core exposes the exchange as a **transport-agnostic operation**: the application
+supplies something that can carry request and response messages, and the crate runs the
+session. The application keeps full control of its HTTP surface, its TLS, and its
+authentication.
+
+### What the crate provides
+
+| Layer | Provided by | Notes |
+|---|---|---|
+| The exchange logic | the crate | diff, merge, LWW, progress |
+| A message type | the crate | serialisable, transport-independent |
+| The wire format | the crate | JSON, or binary behind a feature |
+| REST endpoints | the crate, optionally | `merkle-lww-axum` |
+| WebSocket handling | the crate, optionally | `merkle-lww-axum` |
+| TLS | **the application** | usually terminated by a proxy or ingress |
+| Authentication | **the application** | the crate checks the credential it is given |
+| Routing, middleware, session management | **the application** | |
+
+### Why the crate ships REST and WebSocket anyway
+
+Because writing a correct session handler — resumption, progress frames, the handshake
+validation, the quiesce check — is work an application should not have to repeat, and
+getting it subtly wrong produces divergence rather than an error.
+
+So `merkle-lww-axum` provides both, and an application that wants them uses them. An
+application that needs neither — because it already has a session layer, or because it
+wants to expose sync over something else entirely — calls the core directly.
+
+The guidance for implementers is in
+[implementation.md](implementation.md).
+
 ## Components
 
 ```

@@ -70,14 +70,17 @@ See [ADR-0008](adr/0008-two-peer-identity-layers.md).
 **The crate does not terminate TLS.** This is deliberate, and it keeps a TLS stack out of
 the dependency list entirely.
 
-The natural arrangement is that TLS terminates in front of the crate — an ingress
-controller, a service mesh, a reverse proxy, or `axum-server` with rustls in the same
-process but outside the crate. The crate then authenticates the peer with whatever
-credential the deployment already has.
+The application terminates TLS wherever it already does — an ingress controller, a service
+mesh, a reverse proxy, or `axum-server` with rustls in the consuming application. The
+crate then authenticates the peer with whatever credential the deployment already has.
 
-If the crate does terminate TLS (via `axum-server` and rustls, in the consuming
-application rather than in the crate), `PeerAuth::ClientCert` is the natural fit: the
-client certificate's subject or SAN is checked against the configured peer.
+This is part of the broader division: **the crate provides the data exchange; the
+application provides the transport.** See
+[implementation.md](implementation.md) and [architecture.md](architecture.md) §
+"Transport".
+
+If the application does terminate TLS itself, `PeerAuth::ClientCert` is the natural fit:
+the client certificate's subject or SAN is checked against the configured peer.
 
 What the crate must do either way:
 
