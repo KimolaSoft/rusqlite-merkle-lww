@@ -2,18 +2,18 @@
 
 ## Managed tables
 
-A **managed table** is a table the crate syncs. For it, the crate owns four columns, the
+A **managed table** is a table the crate syncs. For it, the crate owns some columns, the
 triggers, the indexes it needs, and the DDL.
 
 ```sql
 CREATE TABLE device (
-    sync_ns      TEXT NOT NULL,          -- crate-managed: namespace
-    id           TEXT NOT NULL,          -- application key column
+    sync_id      TEXT NOT NULL,          -- crate-managed: the sync key
+    device_id    TEXT NOT NULL,          -- application: local sequence
     last_update  TEXT NOT NULL,          -- crate-managed: RFC 3339
     status       TEXT NOT NULL,          -- crate-managed: 'live' | 'deleted'
     purge_on     TEXT,                   -- crate-managed: RFC 3339, NULL when live
     payload      TEXT NOT NULL,          -- application column
-    PRIMARY KEY (sync_ns, id)
+    PRIMARY KEY (sync_id)
 );
 ```
 
@@ -21,17 +21,65 @@ The managed column names are configurable per table; these are the defaults.
 
 | Column | Type | Meaning |
 |---|---|---|
-| `sync_ns` | TEXT | The namespace the row belongs to (§ "Key strategies") |
+| `sync_id` | TEXT | **The sync key.** Identifies the entity across sites. Derived, not local. |
 | `last_update` | TEXT | RFC 3339 instant of the last modification. **The ordering key.** |
 | `status` | TEXT | `'live'` or `'deleted'` |
 | `purge_on` | TEXT | When the row may be physically removed. NULL while live. |
 
-`last_update` and `purge_on` are **replicated**. `status` is replicated. `sync_ns` is part
-of the key.
+`last_update`, `status` and `purge_on` are **replicated**. `sync_id` is the key.
 
 `last_update` is written by the engine, not the application — but an application that
 supplies its own value has it respected, which is what makes backfill and import
 possible. See [sqlite-interface.md](sqlite-interface.md).
+
+### The sync key is not the primary key
+
+This is the single most important structural point, and the worked examples in
+[examples.md](examples.md) exist to make it concrete.
+
+The **application's primary key** is a local implementation detail. It might be an
+integer sequence (`userid`), a UUID generated at insert, or a natural key. None of those
+is necessarily meaningful *across* sites.
+
+The **sync key** identifies the entity across sites, so that two sites describing the
+same thing converge on one row.
+
+| The app's PK | Usable as the sync key? |
+|---|---|
+| A local integer sequence (`userid INTEGER PRIMARY KEY`) | **No** — every site has a `userid = 1` |
+| A UUID generated locally at insert | **No** — each site generates a different one |
+| A stable, globally unique natural key (an external system id) | **Yes**, directly |
+| A mutable natural key (email, username) | **Yes, but derived** — see below |
+
+So the crate manages a `sync_id` column, separate from whatever the application uses:
+
+```
+sync_id = uuidv5(namespace, "<entity>:" || <identity columns>)
+```
+
+where the identity columns are those declared as the key's *derivation input*.
+
+### Deriving the sync key
+
+The derivation input must be **stable**, because the sync key is the entity's identity.
+Deriving it from a mutable attribute means an attribute change becomes a *move* rather
+than an update, and moves are expensive.
+
+For a `users` table:
+
+| Derivation | On an email change | Merge identity |
+|---|---|---|
+| `sync_id` from `email` | A move, automatically | The current email |
+| `sync_id` a stable surrogate | A plain update | The original identity, forever |
+
+Both are defensible. The stable surrogate is usually better — identity should not depend
+on a mutable attribute — but it requires the application to have, or accept, an immutable
+id. The crate should support both and let the table spec choose.
+
+The **namespace** in the derivation must be stable across the deployment. A per-table
+constant derived from the table name and the deployment's `epoch_us` is enough to keep
+ids stable within a deployment; ids differ between deployments. If data must move
+between deployments, the namespace must be configurable.
 
 ### Timestamps
 
@@ -45,23 +93,33 @@ Fixed width means **lexicographic order equals chronological order**, so `ORDER 
 last_update` is chronological and `WHERE last_update >= ?` is an index range scan. No date
 functions are needed anywhere in the hot path.
 
-Timestamps are generated in Rust, never with SQLite's `strftime`. `strftime` yields
+Timestamps are generated in Rust, never with SQLite `strftime`. `strftime` yields
 millisecond precision and three fractional digits, which silently breaks the fixed-width
 property when mixed with Rust-generated values.
 
 ## Key strategies
 
-The application brings its own primary key. Four strategies, selected per table.
+The strategy decides **how the sync key is derived**. Selected per table.
 
 ```rust
 pub enum KeyStrategy {
-    /// Owner-namespaced: key = (site_column, user_key_columns…).
-    SiteNamespaced { site_column: String, key_columns: Vec<String> },
+    /// Deterministic id derived from identity columns. Both sites derive the same
+    /// value for the same entity, so they converge on one row.
+    Derived {
+        /// Columns whose values form the derivation input.
+        identity_columns: Vec<String>,
+        /// Optional prefix distinguishing entity kinds within a table.
+        prefix: Option<String>,
+    },
 
-    /// The application already has a globally unique column (UUIDv7, ULID, Snowflake).
+    /// The application already has a globally unique column (an external system id).
     GlobalId { key_columns: Vec<String> },
 
-    /// The crate adds and maintains its own surrogate key column.
+    /// Owner-namespaced: the row's site is part of the key, so two sites never
+    /// contend over the same row.
+    SiteNamespaced { site_column: String, key_columns: Vec<String> },
+
+    /// The crate generates a random surrogate. Never merges across sites.
     Surrogate { column: String },
 
     /// SQLite's implicit rowid. Zero schema impact, but VACUUM can renumber.
@@ -69,12 +127,13 @@ pub enum KeyStrategy {
 }
 ```
 
-| Strategy | Coordination needed | Cross-site same entity | Notes |
+| Strategy | Derivation | Cross-site same entity | Notes |
 |---|---|---|---|
-| `GlobalId` | globally unique IDs | **merges into one row** | `site` becomes an ordinary mutable column |
-| `SiteNamespaced` | none | does **not** merge | Each site owns its own namespace. A row created at `eu-west` stays under `eu-west` forever. |
-| `Surrogate` | none | does not merge | The crate guarantees key uniqueness; the application's PK stays its own business |
-| `Rowid` | none | does not merge | Only when a table has no natural key |
+| `Derived` | `uuidv5(namespace, prefix + identity columns)` | **merges into one row** | The default. Requires stable identity columns |
+| `GlobalId` | the application's own column | **merges into one row** | The column must already be globally unique |
+| `SiteNamespaced` | `(site, key columns)` | does **not** merge | For genuinely per-site data |
+| `Surrogate` | a random UUIDv7 | does not merge | Collisions avoided, merging not achieved |
+| `Rowid` | the rowid | does not merge | Only when a table has no natural key |
 
 ### Choosing: shared dataset versus independent sites
 
@@ -83,63 +142,72 @@ The decision hinges on one question:
 > **When two sites create what should be the same logical entity — the same user, the same
 > order — do they become one row or two?**
 
-| | `GlobalId` | `SiteNamespaced` |
+| | `Derived` / `GlobalId` | `SiteNamespaced` |
 |---|---|---|
 | Rows created | one row, if both sites derive the same id | two rows, both survive |
 | After a sync | one row; LWW picks the winner | two rows, both present |
 | Merge conflict | resolved by `last_update` | none |
-| Coordination needed | a globally unique id scheme | none |
+| Coordination needed | a deterministic id derivation | none |
 
 **If the sites share one dataset** — the same user is the same user everywhere, and the
-sites are peers over a single logical dataset — then `GlobalId` is correct. Two sites
-updating the same user converge on one row, and LWW resolves which write wins. This is the
-expected deployment.
+sites are peers over a single logical dataset — then `Derived` is correct. Two sites
+updating the same user converge on one row, and LWW resolves which write wins. This is
+the expected deployment.
 
 **If the sites own independent data** — multi-tenant, or separately operated — then
-`SiteNamespaced` is correct, and `GlobalId` would be actively harmful: it would merge two
+`SiteNamespaced` is correct, and `Derived` would be actively harmful: it would merge two
 customers' records into one row and let LWW silently discard one of them.
 
-The recommendation is **`GlobalId` as the default**, with `SiteNamespaced` available for
+The recommendation is **`Derived` as the default**, with `SiteNamespaced` available for
 tables that are genuinely per-site. The failure modes are asymmetric: being wrong with
-`GlobalId` loses data irrecoverably, while being wrong with `SiteNamespaced` leaves two
-rows that can still be reconciled deliberately. That asymmetry argues for `SiteNamespaced`
-as the *safe* default — but the common case here is a shared dataset, so `GlobalId` is the
-better default and `SiteNamespaced` is the deliberate opt-in.
+`Derived` loses data irrecoverably, while being wrong with `SiteNamespaced` leaves two
+rows that can still be reconciled deliberately. That asymmetry argues for
+`SiteNamespaced` as the *safe* default — but the common case here is a shared dataset,
+so `Derived` is the better default and `SiteNamespaced` is the deliberate opt-in.
 
 ### Getting the id right
 
-`GlobalId` only merges if **both sites derive the same id** for the same entity. Two
+Merging only happens if **both sites derive the same id** for the same entity. Two
 mechanisms:
 
 | Mechanism | Merges? | Notes |
 |---|---|---|
 | UUIDv7 / ULID / Snowflake generated locally | **no** | Each site generates a *different* id, so the entities stay separate. Useful only when the id is already globally assigned by something upstream. |
-| UUIDv5 derived from a natural key | **yes** | `uuidv5(namespace, "user:alice")` is deterministic, so both sites produce the same id. This is the mechanism for "the same user is the same user". |
+| UUIDv5 derived from identity columns | **yes** | `uuidv5(namespace, "user:alice")` is deterministic, so both sites produce the same id. This is the mechanism for "the same user is the same user". |
 | An id from an existing system of record | **yes** | The id already has global meaning. |
 
-So "the same user is the same user" requires a **deterministic** id — derived from a
-natural key, or assigned by something that already agrees across sites. A randomly
+So "the same user is the same user" requires a **deterministic** id — derived from
+identity columns, or assigned by something that already agrees across sites. A randomly
 generated globally-unique id does not merge anything; it merely avoids collisions.
 
 This is worth being explicit about, because it is the single most common way a
-`GlobalId` deployment fails to behave as intended.
+`Derived` deployment fails to behave as intended.
+
+### Identity columns must be stable
+
+The derivation input is the entity's identity, so it must not change. If it does, the
+sync key changes, and that is a **move** rather than an update.
+
+A `users` table whose identity is `email` therefore treats an email change as a move. A
+`users` table whose identity is a stable surrogate treats it as an update. See
+[examples.md](examples.md) § "Deriving the sync key".
 
 ### Keys are immutable
 
-Changing a key is a **move**, not an update. `Db::move_key(table, from, to)` tombstones
-the old key and inserts the new one atomically.
+Changing a sync key is a **move**, not an update. `Db::move_key(table, from, to)`
+tombstones the old key and inserts the new one atomically.
 
 Every other column is freely mutable, including a `username` or an owner field. Only the
-key columns are special. Under `SiteNamespaced` the namespace column is part of the key
-and is therefore also immutable.
+sync key is special. Under `SiteNamespaced` the site column is part of the key and is
+therefore also immutable.
 
 ### The sync key encoding
 
 The key is encoded canonically (§ "Canonical encoding") into a BLOB, and that BLOB is the
-primary key of `_sync_log`. The encoding includes the namespace, so `(eu-west, abc)` and
-`(tokyo, abc)` are distinct rows in the log.
+primary key of `_sync_log`. Under `SiteNamespaced` the encoding includes the namespace, so
+`(eu-west, abc)` and `(tokyo, abc)` are distinct rows in the log.
 
-## Visibility
+## Column specifications
 
 ```rust
 pub enum Visibility {
@@ -153,8 +221,27 @@ pub struct ColumnSpec {
     pub name: String,
     pub replicated: bool,       // participates in sync and in the digest at all
     pub visibility: Visibility,
+
+    /// The column's value is meaningful only within the site that wrote it — a local
+    /// sequence number, a local counter, a site-specific flag. A remote write never
+    /// overwrites it.
+    pub local: bool,
+
+    /// The column holds a set (a JSON array), and concurrent edits should merge as a
+    /// set rather than replace the whole value.
+    pub merge: MergeMode,
+}
+
+pub enum MergeMode {
+    /// Last write wins on the whole value. The default.
+    LastWriteWins,
+    /// The values are sets; concurrent edits union. Additive only — removals do not
+    /// propagate, so this is only correct for append-only sets.
+    SetUnion,
 }
 ```
+
+### Visibility
 
 | Peer class | Public columns | Restricted columns | May write |
 |---|---|---|---|
@@ -165,6 +252,58 @@ Tables can also be marked `client_visible = false`, which excludes them from cli
 sessions entirely — their existence and shape are not advertised.
 
 Enforcement points are listed in [security.md](security.md).
+
+### Local columns
+
+Some columns are meaningful only within the site that wrote them: a local sequence
+number, a local counter, a site-specific flag. A remote write must not overwrite them,
+because the remote's value is from a different sequence and is meaningless here.
+
+This matters concretely. With a `users` table whose `userid` is a local sequence:
+
+- The sync key is `sync_id`, derived from the user's identity. ✓
+- A remote row arrives with the remote's `userid`, which is a different local number.
+  **The local `userid` must be kept.**
+- If the remote's `userid` collides with a *different* local row's `userid`, the insert
+  fails on the `UNIQUE` constraint.
+
+Verified behaviour (see [examples.md](examples.md)):
+
+```
+remote row (sync_id=sid-a, userid=77) against local row (sync_id=sid-a, userid=1)
+  → the upsert fires on sync_id, the local userid=1 is kept, the remote's 77 is not written ✓
+remote row (sync_id=sid-b, userid=77) against local row (sync_id=sid-a, userid=1)
+  → succeeds, because 77 does not collide with 1
+remote row (sync_id=sid-b, userid=1) against local row (sync_id=sid-a, userid=1)
+  → UNIQUE constraint failed: users.userid   ✗
+```
+
+That last case is a genuine failure, and it is why the application should generally
+**not** put a `UNIQUE` constraint on a local sequence. The constraint is meaningful
+within one site but not across the merged dataset.
+
+Local columns are also **excluded from the digest**. If they were included, two peers
+holding the same entity with different local sequences would compute different digests,
+every bucket would differ, and no sync would ever converge.
+
+### Set-valued columns
+
+A JSON array column is a value under LWW, but the application usually thinks of it as a
+set. Concurrent edits lose one side's change:
+
+```
+site A: ["admin", "dev"]   at t=100
+site B: ["admin", "ops"]   at t=101
+LWW result: ["admin", "ops"]     ← "dev" is lost
+```
+
+The default is `LastWriteWins`, and the limitation is documented rather than papered
+over. `SetUnion` is available for append-only sets, but it is **additive only**: a
+removal never propagates, because the removed element comes back on the next union.
+
+The correct answer for group membership is to **normalise the set into its own table**,
+where each element is an independent row with its own LWW and its own deletion. See
+[examples.md](examples.md) § "The `"Groups"` column".
 
 ## Internal tables
 
@@ -181,7 +320,7 @@ Keys: `node_id`, `site`, `epoch_us`, `schema_version`, `last_purge_instant`,
 ```sql
 CREATE TABLE _sync_log (
     tbl          TEXT    NOT NULL,
-    k            BLOB    NOT NULL,   -- canonical encoded key
+    k            BLOB    NOT NULL,   -- canonical encoded sync key
     hlc_us       INTEGER NOT NULL,   -- unix micros; == the row's last_update
     digest       BLOB    NOT NULL,   -- 16 bytes
     deleted      INTEGER NOT NULL DEFAULT 0,
@@ -221,10 +360,10 @@ CREATE TABLE _sync_staging (
 
 ```rust
 digest  = seeded_xxh3(seed,
-                      key_enc || last_update || status || purge_on
-                      || concat over replicated columns of value_enc)
+                      sync_id || last_update || status || purge_on
+                      || concat over replicated, non-local columns of value_enc)
 
-row_hash = xxh3(key_enc || last_update || status || purge_on || digest)
+row_hash = xxh3(sync_id || last_update || status || purge_on || digest)
 ```
 
 Four jobs, one value:
@@ -238,6 +377,19 @@ Four jobs, one value:
    recompute still computes the *same* `row_hash`, because `row_hash` is a function of the
    digest rather than of the payload. This is what lets a read-only client participate in
    tree diffing without ever holding a restricted value.
+
+### Local columns are excluded
+
+The digest covers replicated columns **except** those marked `local`.
+
+This is required for convergence. Two peers holding the same entity have different local
+sequence values — `userid = 1` at one site and `userid = 77` at the other. If those were
+in the digest, the two peers would compute different digests for the same entity, every
+bucket would differ, and no sync would ever converge.
+
+Excluding them means the digest describes the **entity**, not the site's local view of
+it. The local column is still stored and still transmitted — it is simply not part of the
+identity of the row.
 
 ### The digest is keyed
 
@@ -265,8 +417,10 @@ Determinism matters for hashing and for the wire format. Two peers must derive i
 bytes from identical logical rows.
 
 ```
-key_enc   := concat over key columns of       tag(u8) || len(u32 LE) || bytes
-value_enc := concat over replicated value columns of tag(u8) || len(u32 LE) || bytes
+sync_id_enc := the sync key's bytes (the derived uuid, or the namespace
+               and key columns for SiteNamespaced)
+value_enc   := concat over replicated, non-local value columns of
+               tag(u8) || len(u32 LE) || bytes
 
 tag: 0 = NULL
      1 = INTEGER (i64, little-endian)

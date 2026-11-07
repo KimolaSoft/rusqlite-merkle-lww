@@ -67,8 +67,8 @@ both sides choose identical depths.
 ## Hash construction
 
 ```
-digest      = seeded_xxh3(key || last_update || status || purge_on || replicated_values)
-row_hash    = xxh3(key_enc || last_update || status || purge_on || digest)
+digest      = seeded_xxh3(sync_id || last_update || status || purge_on || replicated_values)
+row_hash    = xxh3(sync_id || last_update || status || purge_on || digest)
 
 hour_hash   = xxh3(hour_id_be  || row_count_be || Σ row_hash)
 cycle_hash  = xxh3(cycle_id_be || concat over 24 hours of (hour_id_be || hour_hash))

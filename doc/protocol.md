@@ -149,6 +149,27 @@ the same digest for the same row, so they reach the same conclusion.
 Because the digest is keyed, only trusted peers can compute it. A client never performs
 the tie-break — it applies what the server sends.
 
+### Local columns are kept
+
+When taking the incoming row, columns marked `local` are **not** taken. The remote's value
+for a local sequence number belongs to a different sequence and is meaningless here:
+
+```
+apply(incoming, local):
+    winner = the row chosen by the LWW rule above
+    result = winner, but with every `local` column taken from `local`
+```
+
+This is what keeps a merged row's local `userid` intact when a remote copy arrives, and
+it is why local columns are excluded from the digest — see
+[data-model.md](data-model.md) § "Local columns".
+
+### Set-valued columns
+
+A column whose merge mode is `SetUnion` is merged as a union rather than replaced. The
+default is whole-value replacement, under which a concurrent edit to a JSON array loses
+one side's change. See [data-model.md](data-model.md) § "Set-valued columns".
+
 A row is applied to the user table and to `_sync_log` in one transaction, and the tree is
 updated incrementally.
 

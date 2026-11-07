@@ -33,8 +33,8 @@ There is no query builder, no ORM, and no wrapper for any SQL operation.
 
 ```rust
 let conn = db.conn()?;                       // instrumented
-conn.execute("INSERT INTO device(sync_ns, id, payload) VALUES (?1, ?2, ?3)",
-             params![ns, id, payload])?;       // plain SQL
+conn.execute("INSERT INTO device(sync_id, payload) VALUES (?1, ?2)",
+             params![sync_id, payload])?;       // plain SQL
 ```
 
 A small managed layer exists for convenience — `Db::upsert`, `Db::delete`,

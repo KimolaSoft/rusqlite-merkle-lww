@@ -44,9 +44,9 @@ encoding.
 
 - Workspace with three crates: `merkle-lww-core`, `merkle-lww-axum`, `merkle-lww-cli`.
 - `config.rs`: `SyncConfig`, `TableSpec`, `ColumnSpec`, `KeyStrategy`, `Visibility`,
-  `TableKind`, `Peer`, `PeerAuth`, `CacheConfig`, `Role`, `WriteMode`. All `serde`-derived
-  with `Default`.
-- `codec.rs`: canonical key and value encoding; seeded xxh3 digest; the two-level
+  `TableKind`, `MergeMode`, `Peer`, `PeerAuth`, `CacheConfig`, `Role`, `WriteMode`. All
+  `serde`-derived with `Default`.
+- `codec.rs`: canonical sync-id and value encoding; seeded xxh3 digest; the two-level
   `row_hash`.
 - `time.rs`: RFC 3339 parsing and formatting at fixed six-digit precision; the
   monotonic issuance guard.
@@ -61,6 +61,12 @@ encoding.
   with the persisted value loaded at startup and written back on change.
 - The canonical encoding is the one thing that must not change once data exists. Get it
   right now.
+- **`KeyStrategy::Derived` needs a deterministic id derivation.** `uuidv5` over a
+  per-table namespace and the identity columns. The namespace must be stable across the
+  deployment, and configurable if data must move between deployments.
+- **Local columns are excluded from the digest**, not merely from the merge. Including
+  them would make two peers holding the same entity compute different digests, so every
+  bucket would differ and nothing would ever converge.
 
 ### Exit criteria
 
@@ -70,6 +76,8 @@ encoding.
   to the same bytes (`proptest`).
 - Timestamps round-trip through parse and format at fixed six-digit precision, and sort
   lexicographically in chronological order.
+- **The derived sync id is deterministic**: the same identity columns produce the same
+  id on every node, and different identity columns produce different ids.
 
 **Test suites:** 14 (canonical encoding).
 
@@ -359,6 +367,9 @@ These are unresolved, and the ones marked **blocking** hold up a specific phase.
 | 6 | **Is the purge period daily, or aligned to the retention window?** Daily gives predictable instants; aligned to retention makes tombstones live exactly 30 days. | Purge cadence | Phase 5 |
 | 7 | **Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?** Only staged rows, presumably, but a row written and deleted within one interval is lost — acceptable, since it was never visible to a peer. | Drain semantics | Phase 1 |
 | 8 | **Should `AppendOnly` tables exist?** They remove the delete machinery from the trigger set, at the cost of a second code path. | Scope of the trigger set | Phase 1 |
+| 9 | **Should the crate manage the `sync_id` column, or require the application to provide it?** | Schema ownership | Phase 1 |
+| 10 | **How is the derivation namespace chosen?** A per-table constant from the table name and `epoch_us` keeps ids stable within a deployment but differs between deployments. | Id stability | Phase 0 |
+| 11 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | Phase 6 |
 
 Questions 1 and 3 change the shape of the code. The rest can be settled during the phase
 they affect.

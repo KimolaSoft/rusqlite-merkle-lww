@@ -31,6 +31,12 @@ How many rows are applied at once. The three bulk paths, SQLite's 32,766 bound-p
 limit and how the chunk size is derived, and how the last-write-wins filter is expressed
 in the upsert itself.
 
+### [examples.md](examples.md)
+
+Two worked example databases — a `users` table and a `groups` table — taken all the way
+through the design. They show why the sync key must be separate from the application's
+primary key, what a "local" column is, and why a JSON array column is not a value.
+
 ### [sqlite-interface.md](sqlite-interface.md)
 
 How the crate interacts with SQLite. The trigger set, the authorizer rules, the two
@@ -97,6 +103,8 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | [0008](adr/0008-two-peer-identity-layers.md) | Peer identity is a stable id plus a separate credential |
 | [0009](adr/0009-progress-has-no-eta.md) | Progress is X-of-Y; no ETA in the protocol |
 | [0010](adr/0010-no-orm-query-wrapper.md) | No ORM; the crate owns the connection, not the query language |
+| [0011](adr/0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport |
+| [0012](adr/0012-sync-key-is-separate-from-the-primary-key.md) | The sync key is separate from the application's primary key |
 
 ## Conventions used throughout
 
@@ -117,7 +125,7 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | **digest** | xxh3-128 over a row's replicated content, keyed with the deployment seed |
 | **row hash** | The value folded into a bucket hash; covers key, timestamp, status, digest |
 | **managed table** | A table the crate syncs, and for which it owns columns, triggers and DDL |
-| **managed column** | A column the crate owns: `sync_ns`, `last_update`, `status`, `purge_on` |
+| **managed column** | A column the crate owns: `sync_id`, `last_update`, `status`, `purge_on` |
 | **dialect** | Which trigger flavour is in use: *enforced* (Rust UDF) or *compatible* (pure SQL) |
 | **quiesce window** | The interval around a purge instant during which sync is refused |
 | **purge instant** | The globally scheduled moment at which tombstones are removed |

@@ -90,21 +90,21 @@ and discards it. `NEW.last_update` is unchanged. The two forms that do work:
 ```sql
 -- last_update is stamped by the engine, but an explicit value is respected.
 CREATE TABLE device (
-    sync_ns      TEXT NOT NULL,
-    id           TEXT NOT NULL,
+    sync_id      TEXT NOT NULL,
+    device_id    TEXT NOT NULL,          -- application column; may be a local sequence
     last_update  TEXT NOT NULL DEFAULT (sync_stamp()),
     status       TEXT NOT NULL DEFAULT 'live',
     purge_on     TEXT,
     payload      TEXT NOT NULL,
-    PRIMARY KEY (sync_ns, id)
+    PRIMARY KEY (sync_id)
 );
 
 -- INSERT: nothing to stamp, the DEFAULT fires. Log the new row.
 CREATE TRIGGER sync_device_ai AFTER INSERT ON device BEGIN
     INSERT INTO _sync_log(tbl, k, hlc_us, digest, deleted)
-    VALUES ('device', sync_key(NEW.sync_ns, NEW.id),
+    VALUES ('device', NEW.sync_id,
             sync_us(NEW.last_update),
-            sync_digest(NEW.sync_ns, NEW.id, NEW.last_update,
+            sync_digest(NEW.sync_id, NEW.last_update,
                         NEW.status, NEW.purge_on, NEW.payload),
             NEW.status = 'deleted')
     ON CONFLICT(tbl, k) DO UPDATE SET
@@ -122,14 +122,14 @@ END;
 
 CREATE TRIGGER sync_device_au AFTER UPDATE ON device BEGIN
     INSERT INTO _sync_log(tbl, k, hlc_us, digest, deleted)
-    VALUES ('device', sync_key(NEW.sync_ns, NEW.id),
+    VALUES ('device', NEW.sync_id,
             sync_us(NEW.last_update), sync_digest(...), NEW.status = 'deleted')
     ON CONFLICT(tbl, k) DO UPDATE SET ...;
 END;
 
 -- DELETE: the crate only ever hard-deletes during purge, so the log row goes too.
 CREATE TRIGGER sync_device_ad AFTER DELETE ON device BEGIN
-    DELETE FROM _sync_log WHERE tbl = 'device' AND k = sync_key(OLD.sync_ns, OLD.id);
+    DELETE FROM _sync_log WHERE tbl = 'device' AND k = OLD.sync_id;
 END;
 ```
 

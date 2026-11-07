@@ -56,25 +56,42 @@ let config = SyncConfig {
 
 ```rust
 let spec = TableSpec {
-    name: "device".into(),
+    name: "users".into(),
     kind: TableKind::Keyed,
-    key: KeyStrategy::GlobalId {
-        key_columns: vec!["id".into()],     // must be globally unique across sites
+    key: KeyStrategy::Derived {
+        identity_columns: vec!["email".into()],
+        prefix: Some("user".into()),
     },
     columns: vec![
-        ColumnSpec { name: "payload".into(), replicated: true,  visibility: Visibility::Public },
-        ColumnSpec { name: "secret".into(), replicated: true,  visibility: Visibility::Restricted },
+        ColumnSpec { name: "userid".into(),   replicated: true, visibility: Visibility::Public,
+                     local: true, merge: MergeMode::LastWriteWins },
+        ColumnSpec { name: "username".into(), replicated: true, visibility: Visibility::Public,
+                     local: false, merge: MergeMode::LastWriteWins },
+        ColumnSpec { name: "email".into(),    replicated: true, visibility: Visibility::Public,
+                     local: false, merge: MergeMode::LastWriteWins },
+        ColumnSpec { name: "secret".into(),   replicated: true, visibility: Visibility::Restricted,
+                     local: false, merge: MergeMode::LastWriteWins },
     ],
     client_visible: true,
 };
 ```
 
-**For the id to merge across sites, it must be the same id everywhere.** A randomly
-generated UUIDv7 at each site produces two different rows for the same user. Use a
-deterministic id — derived from a natural key, or issued by whatever already agrees
-across sites. See [data-model.md](data-model.md) § "Getting the id right".
+Three things to get right here:
 
-For a table whose rows are genuinely per-site, use `SiteNamespaced` instead.
+**The sync key is separate from your primary key.** The crate manages a `sync_id` column,
+derived from the identity columns. Your `userid INTEGER PRIMARY KEY` stays exactly as it
+is — a local sequence that only means something on the site that issued it. That is why
+`userid` is marked `local: true`: a remote write never overwrites it.
+
+**The identity columns must be stable.** `sync_id` is the entity's identity, so deriving
+it from `email` means an email change is a *move* rather than an update. If email is
+mutable in your app, derive from something immutable instead.
+
+**For the same user to be the same user across sites, the derivation must be
+deterministic** — which `Derived` is. A randomly generated id at each site would not
+merge. See [data-model.md](data-model.md) § "Getting the id right".
+
+For a table whose rows are genuinely per-site, use `KeyStrategy::SiteNamespaced` instead.
 
 ### 3. Open the store
 
@@ -87,8 +104,8 @@ db.migrate()?;                 // create or adopt the managed tables
 
 ```rust
 let conn = db.conn()?;                        // pooled, instrumented
-conn.execute("INSERT INTO device(id, payload) VALUES (?1, ?2)",
-             params!["abc", "v1"])?;
+conn.execute("INSERT INTO users(userid, username, email) VALUES (?1, ?2, ?3)",
+             params![42, "alice", "alice@example.com"])?;
 ```
 
 **This is the important part.** The connection must come from `Db::conn()`, or from a
@@ -147,28 +164,59 @@ To import, write the value you want. To update, omit the column:
 
 ```sql
 -- Good: the crate stamps this.
-UPDATE device SET payload = 'v2' WHERE id = ?1;
+UPDATE users SET username = 'alice2' WHERE email = ?1;
 
 -- Only when importing historical data, where the timestamp is the point:
-UPDATE device SET payload = 'v2', last_update = '2024-01-01T00:00:00.000000Z'
- WHERE id = ?1;
+UPDATE users SET username = 'alice2', last_update = '2024-01-01T00:00:00.000000Z'
+ WHERE email = ?1;
 ```
 
 ### Do not write the managed columns
 
-`status` and `purge_on` are crate-managed. Use `Db::delete()` for a delete:
+`status`, `purge_on` and `sync_id` are crate-managed. Use `Db::delete()` for a delete:
 
 ```rust
-db.delete("device", &key)?;      // sets status and purge_on
+db.delete("users", &key)?;       // sets status and purge_on
 ```
 
 A raw `DELETE` is converted to a soft delete by a trigger, and a raw write to `status` is
 rejected by the authorizer on instrumented connections.
 
+Writing `sync_id` directly would break the identity of the row — the crate derives it from
+the identity columns and would overwrite your value on the next write.
+
+### Do not rely on a local column surviving a merge
+
+A column marked `local: true` — a local sequence, a local counter — keeps its **local**
+value when a remote copy arrives. That is the point: the remote's value comes from a
+different sequence and means nothing here.
+
+The corollary is that such a column should not carry a `UNIQUE` constraint, because the
+constraint holds within one site but not across the merged dataset. A remote row whose
+local sequence collides with a different local row will fail to insert.
+
+### Do not expect a JSON array column to merge as a set
+
 ### Do not write to `_sync_*`
 
 These are internal. The authorizer rejects writes on instrumented connections, and the
 log guard rejects them on any connection.
+
+### Do not expect a JSON array column to merge as a set
+
+A column holding a JSON array is merged as a **value** under last-write-wins, so two sites
+editing the same array concurrently lose one side's change:
+
+```
+site A: ["admin", "dev"]   site B: ["admin", "ops"]   →  ["admin", "ops"]
+```
+
+If membership needs to merge correctly, normalise it into its own table — one row per
+member, each with its own last-write-wins and its own deletion. That is the same table a
+`groups` schema wants anyway.
+
+`MergeMode::SetUnion` is available, but it is additive only: a removal never propagates,
+because the removed element comes back on the next union.
 
 ### Keep clocks synchronised
 
@@ -215,8 +263,8 @@ touched.
 
 ```rust
 db.transaction(|tx| {
-    tx.upsert("device", &key, values)?;
-    tx.upsert("reading", &reading_key, readings)?;
+    tx.upsert("users", &key, values)?;
+    tx.upsert("readings", &reading_key, readings)?;
     Ok(())
 })?;
 ```

@@ -40,9 +40,9 @@ and silently** — nothing ever reports it.
 **The digest is always computed.** It is not an option.
 
 ```
-digest   = seeded_xxh3(seed, key_enc || last_update || status || purge_on
-                             || concat over replicated columns of value_enc)
-row_hash = xxh3(key_enc || last_update || status || purge_on || digest)
+digest   = seeded_xxh3(seed, sync_id || last_update || status || purge_on
+                             || concat over replicated, non-local columns of value_enc)
+row_hash = xxh3(sync_id || last_update || status || purge_on || digest)
 ```
 
 **The digest is keyed** with a deployment secret (`seed`), using seeded xxh3.
