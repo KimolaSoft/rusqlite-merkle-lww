@@ -67,13 +67,19 @@ both sides choose identical depths.
 ## Hash construction
 
 ```
-digest      = seeded_xxh3(sync_id || last_update || status || purge_on || replicated_values)
-row_hash    = xxh3(sync_id || last_update || status || purge_on || digest)
+digest      = seeded_xxh3(key || last_update || status || purge_on || replicated_values)
+row_hash    = xxh3(key || last_update || status || purge_on || digest)
 
 hour_hash   = xxh3(hour_id_be  || row_count_be || Σ row_hash)
 cycle_hash  = xxh3(cycle_id_be || concat over 24 hours of (hour_id_be || hour_hash))
 month_hash  = xxh3(month_id_be || concat over 30 cycles of (cycle_id_be || cycle_hash))
 ```
+
+`key` is the sync key — the application's own column under `GlobalId`, or the crate-managed
+`sync_id` under the other strategies. `replicated_values` is every replicated column
+except those already named, in the registered order. That includes the `site` column on
+tables with allocated identifiers: it is replicated, so both peers must agree on it, and a
+disagreement must show up as a differing digest rather than as a silent divergence.
 
 All integer fields are big-endian.
 

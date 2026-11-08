@@ -174,6 +174,29 @@ against a 30-day horizon is irrelevant, but it does mean the floor is approximat
 is acceptable, because the alternative — an exact per-key floor — is exactly the state
 the scheduled purge exists to avoid.
 
+## Decommissioning a site
+
+A site is retired by soft-deleting its row in the `sites` registry — the same mechanism
+as any other row, `status = 'deleted'`, with a `purge_on` set by the usual retention
+policy.
+
+**Its range is retired with it.** A retired range is never reissued, exactly like a
+retired identifier. This is the reason the range is immutable in the first place: if a
+site's range could be moved, and the site later came back with the same range, the
+identifiers it had minted would collide with its own history.
+
+A site row is a small, infrequent, administrative record, so it is a reasonable exception
+to the purge schedule: it may be kept indefinitely. The `sites` table can be marked
+`AppendOnly` — see [sqlite-interface.md](sqlite-interface.md) — so that retiring a site is
+a soft delete that never becomes a physical removal.
+
+Note the asymmetry this creates, and it is deliberate:
+
+| | Identifiers | Site rows |
+|---|---|---|
+| Retired | Never reissued | Soft-deleted, may be retained forever |
+| Purged | After the retention window | Only if the table is not `AppendOnly` |
+
 ## Retention versus the comparison tiers
 
 `purge_on` is a **tombstone** lifetime, not a data lifetime. Live data never expires, so

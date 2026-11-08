@@ -7,79 +7,143 @@ triggers, the indexes it needs, and the DDL.
 
 ```sql
 CREATE TABLE device (
-    sync_id      TEXT NOT NULL,          -- crate-managed: the sync key
-    device_id    TEXT NOT NULL,          -- application: local sequence
+    userid       INTEGER NOT NULL,       -- application: globally unique, never reused
+    site         TEXT NOT NULL,          -- crate-managed: the site that owns the identifier
     last_update  TEXT NOT NULL,          -- crate-managed: RFC 3339
     status       TEXT NOT NULL,          -- crate-managed: 'live' | 'deleted'
     purge_on     TEXT,                   -- crate-managed: RFC 3339, NULL when live
     payload      TEXT NOT NULL,          -- application column
-    PRIMARY KEY (sync_id)
+    PRIMARY KEY (userid)
 );
 ```
 
 The managed column names are configurable per table; these are the defaults.
 
-| Column | Type | Meaning |
-|---|---|---|
-| `sync_id` | TEXT | **The sync key.** Identifies the entity across sites. Derived, not local. |
-| `last_update` | TEXT | RFC 3339 instant of the last modification. **The ordering key.** |
-| `status` | TEXT | `'live'` or `'deleted'` |
-| `purge_on` | TEXT | When the row may be physically removed. NULL while live. |
+| Column | Type | Managed? | Meaning |
+|---|---|---|---|
+| `last_update` | TEXT | always | RFC 3339 instant of the last modification. **The ordering key.** |
+| `status` | TEXT | always | `'live'` or `'deleted'` |
+| `purge_on` | TEXT | always | When the row may be physically removed. NULL while live. |
+| `site` | TEXT | when the table has allocated identifiers | The site that owns the identifier. See below. |
+| *the key column* | — | only if the app has no usable key | **The sync key.** See below. |
 
-`last_update`, `status` and `purge_on` are **replicated**. `sync_id` is the key.
+`last_update`, `status` and `purge_on` are **replicated**, and always managed by the
+crate.
+
+**The key column is managed only when the application cannot supply one.** With
+`KeyStrategy::GlobalId`, the application's own globally unique column is the key and the
+crate adds nothing. With `Derived`, `SiteNamespaced` or `Surrogate`, the crate manages a
+`sync_id` (or `sync_ns`) column.
+
+**The `site` column is managed only when the table has allocated identifiers.** It is
+replicated and included in the digest. See § "The `site` column".
 
 `last_update` is written by the engine, not the application — but an application that
 supplies its own value has it respected, which is what makes backfill and import
 possible. See [sqlite-interface.md](sqlite-interface.md).
 
-### The sync key is not the primary key
+### The sync key should be the application's own key, when it can be
 
-This is the single most important structural point, and the worked examples in
-[examples.md](examples.md) exist to make it concrete.
+The **sync key** identifies the entity across sites, so that two sites describing the same
+thing converge on one row.
 
-The **application's primary key** is a local implementation detail. It might be an
-integer sequence (`userid`), a UUID generated at insert, or a natural key. None of those
-is necessarily meaningful *across* sites.
+The best case is that the application already has a key that is **globally unique and
+stable**, and then the sync key is simply that column — no extra column, no derivation.
 
-The **sync key** identifies the entity across sites, so that two sites describing the
-same thing converge on one row.
-
-| The app's PK | Usable as the sync key? |
+| The app's key | Usable as the sync key? |
 |---|---|
-| A local integer sequence (`userid INTEGER PRIMARY KEY`) | **No** — every site has a `userid = 1` |
-| A UUID generated locally at insert | **No** — each site generates a different one |
-| A stable, globally unique natural key (an external system id) | **Yes**, directly |
-| A mutable natural key (email, username) | **Yes, but derived** — see below |
+| A globally unique, never-reused identifier (a `userid` allocated from a per-site range) | **Yes, directly.** No extra column. |
+| A stable, globally unique natural key (an external system id) | **Yes, directly.** |
+| A locally generated UUID | **Yes** — but it merges nothing, only avoids collisions |
+| A local integer sequence | **No** — every site has a `1` |
+| A mutable natural key (email) | **No** — a change becomes a move |
 
-So the crate manages a `sync_id` column, separate from whatever the application uses:
+So the rule is: **use the application's own key if it is already global and stable;
+otherwise derive one.**
+
+### When a derived key is needed
+
+Some applications cannot offer a globally unique key — a local integer sequence, or a
+mutable one. Then the crate manages a separate column:
 
 ```
-sync_id = uuidv5(namespace, "<entity>:" || <identity columns>)
+sync_id = uuidv5(namespace, prefix + identity_columns)
 ```
 
-where the identity columns are those declared as the key's *derivation input*.
-
-### Deriving the sync key
-
-The derivation input must be **stable**, because the sync key is the entity's identity.
-Deriving it from a mutable attribute means an attribute change becomes a *move* rather
-than an update, and moves are expensive.
-
-For a `users` table:
+The application's primary key is untouched and remains its own business. The derivation
+input must be **stable**, because the sync key is the entity's identity; if it changes, the
+key changes, and that is a **move** rather than an update.
 
 | Derivation | On an email change | Merge identity |
 |---|---|---|
 | `sync_id` from `email` | A move, automatically | The current email |
 | `sync_id` a stable surrogate | A plain update | The original identity, forever |
 
-Both are defensible. The stable surrogate is usually better — identity should not depend
+Both are supported. The stable surrogate is usually better — identity should not depend
 on a mutable attribute — but it requires the application to have, or accept, an immutable
-id. The crate should support both and let the table spec choose.
+id. The table spec chooses.
 
 The **namespace** in the derivation must be stable across the deployment. A per-table
 constant derived from the table name and the deployment's `epoch_us` is enough to keep
 ids stable within a deployment; ids differ between deployments. If data must move
 between deployments, the namespace must be configurable.
+
+### Globally unique identifiers need an allocation scheme
+
+A globally unique, never-reused identifier does not come for free. A site needs either a
+reserved range or a prefix, and the scheme must be shared across the deployment so peers
+can validate the identifiers they receive.
+
+The ranges live in a **site registry** — a replicated table, and part of the join bundle,
+because a node cannot validate an identifier it has no range for. The registry lives in the
+**main database**: triggers cannot reference an attached database, and the range check must
+be a trigger.
+
+See [examples.md](examples.md) § "Allocating locally, and never reusing" for the two
+schemes and § "Example 3 — `sites`" for the registry, and
+[adr/0013-site-registry-and-range-allocation.md](adr/0013-site-registry-and-range-allocation.md)
+for the full decision.
+
+### The `site` column
+
+A table with globally unique identifiers carries a `site` column naming **the site that
+owns the identifier** — the site whose range contains it.
+
+It is **not** the site that last wrote the row. When site 2 edits a user created by site 1,
+the row's `site` stays `site1` and only `last_update` moves. If `site` tracked the writer,
+the identifier would fall outside the new owner's range and the range check would fire on a
+legitimate edit.
+
+| Property | Value |
+|---|---|
+| Managed by | The crate — the application creates the column, the crate fills it. |
+| Replicated | Yes. |
+| In the digest | Yes — both peers must agree on the owner. |
+| Value | The local site by default: `site TEXT NOT NULL DEFAULT (local_site())`. |
+| Immutable | Yes, for the life of the row. |
+
+The column is populated by the engine, not the application. A scalar function in a column
+`DEFAULT` is evaluated per insert, an explicit value overrides it, and a connection without
+the function fails closed — the Enforced dialect's existing behaviour applied to one more
+column.
+
+The engine-level range check is then a trigger keyed on the row's own owner:
+
+```sql
+CREATE TRIGGER users_range BEFORE INSERT ON users
+WHEN EXISTS (
+    SELECT 1 FROM sites s
+    WHERE s.site_id = NEW.site
+      AND NOT (NEW.userid BETWEEN s.uid_start AND s.uid_end)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'userid outside own site range');
+END;
+```
+
+It fires only when the registry **knows** the row's owner. A site created mid-session may
+have its rows arrive before the registry row does, and rejecting them would deadlock the
+conversation; such rows are accepted provisionally and re-validated later.
 
 ### Timestamps
 
@@ -99,21 +163,26 @@ property when mixed with Rust-generated values.
 
 ## Key strategies
 
-The strategy decides **how the sync key is derived**. Selected per table.
+The strategy decides **which column is the sync key**, and therefore how the key is
+derived. Selected per table.
 
 ```rust
 pub enum KeyStrategy {
-    /// Deterministic id derived from identity columns. Both sites derive the same
-    /// value for the same entity, so they converge on one row.
+    /// The application's own column, already globally unique and stable. Used
+    /// directly as the sync key — no extra column, no derivation.
+    ///
+    /// For example a `userid` allocated from a per-site range.
+    GlobalId { key_columns: Vec<String> },
+
+    /// A deterministic id derived by the crate from identity columns. Both sites
+    /// derive the same value for the same entity, so they converge on one row.
+    /// The crate manages the column.
     Derived {
         /// Columns whose values form the derivation input.
         identity_columns: Vec<String>,
         /// Optional prefix distinguishing entity kinds within a table.
         prefix: Option<String>,
     },
-
-    /// The application already has a globally unique column (an external system id).
-    GlobalId { key_columns: Vec<String> },
 
     /// Owner-namespaced: the row's site is part of the key, so two sites never
     /// contend over the same row.
@@ -127,13 +196,16 @@ pub enum KeyStrategy {
 }
 ```
 
-| Strategy | Derivation | Cross-site same entity | Notes |
+| Strategy | Derivation | Merges across sites? | Extra column? |
 |---|---|---|---|
-| `Derived` | `uuidv5(namespace, prefix + identity columns)` | **merges into one row** | The default. Requires stable identity columns |
-| `GlobalId` | the application's own column | **merges into one row** | The column must already be globally unique |
-| `SiteNamespaced` | `(site, key columns)` | does **not** merge | For genuinely per-site data |
-| `Surrogate` | a random UUIDv7 | does not merge | Collisions avoided, merging not achieved |
-| `Rowid` | the rowid | does not merge | Only when a table has no natural key |
+| `GlobalId` | the application's own column | **yes**, if the column is globally unique | **no** |
+| `Derived` | `uuidv5(namespace, prefix + identity columns)` | **yes** | yes, crate-managed |
+| `SiteNamespaced` | `(site, key columns)` | no | yes, crate-managed |
+| `Surrogate` | a random UUIDv7 | no | yes, crate-managed |
+| `Rowid` | the rowid | no | no |
+
+`GlobalId` is the default, because the expected deployment has a globally unique
+identifier already. `Derived` covers the applications that do not.
 
 ### Choosing: shared dataset versus independent sites
 
@@ -238,6 +310,39 @@ pub enum MergeMode {
     /// The values are sets; concurrent edits union. Additive only — removals do not
     /// propagate, so this is only correct for append-only sets.
     SetUnion,
+}
+```
+
+### Allocation
+
+A table whose identifiers come from a per-site range declares how the identifiers are
+allocated. The crate then installs the range-enforcement trigger and manages the `site`
+column.
+
+```rust
+pub struct AllocationSpec {
+    /// The column holding the globally unique identifier.
+    pub id_column: String,
+
+    /// The column naming the site that owns the identifier. The crate manages it.
+    pub site_column: String,
+
+    /// The registry table holding the site ranges. Must be in the same database as the
+    /// table — triggers cannot reference an attached database.
+    pub registry_table: String,
+}
+```
+
+```rust
+pub struct TableSpec {
+    pub name: String,
+    pub kind: TableKind,
+    pub key: KeyStrategy,
+    pub columns: Vec<ColumnSpec>,
+    pub client_visible: bool,
+
+    /// Present when the identifiers are allocated from per-site ranges.
+    pub allocation: Option<AllocationSpec>,
 }
 ```
 

@@ -133,18 +133,91 @@ CREATE TRIGGER sync_device_ad AFTER DELETE ON device BEGIN
 END;
 ```
 
-### The three UDFs
+### The allocation triggers
+
+Tables whose identifiers come from a per-site range get three more triggers. The registry
+table holds the ranges and **must live in the same database** — a trigger cannot reference
+an object in an attached database, so a separate `sites.db` is not an option.
+
+```sql
+-- The registry. The range is immutable; everything else is ordinary mutable data.
+CREATE TABLE sites (
+    site_id     TEXT NOT NULL,
+    site_name   TEXT NOT NULL,
+    uid_start   INTEGER NOT NULL,
+    uid_end     INTEGER NOT NULL,
+    city        TEXT,
+    country     TEXT,
+    last_update TEXT NOT NULL DEFAULT (sync_stamp()),
+    status      TEXT NOT NULL DEFAULT 'live',
+    purge_on    TEXT,
+    PRIMARY KEY (site_id),
+    CHECK (uid_start <= uid_end),
+    UNIQUE (uid_start)
+);
+
+-- A range may not be edited. A site is renamed; its range is not moved.
+CREATE TRIGGER sync_sites_bu_range BEFORE UPDATE ON sites
+WHEN NEW.uid_start <> OLD.uid_start OR NEW.uid_end <> OLD.uid_end
+BEGIN
+    SELECT RAISE(ABORT, 'site range is immutable');
+END;
+
+-- Ranges may not overlap, or two sites could mint the same identifier.
+CREATE TRIGGER sync_sites_bi_range BEFORE INSERT ON sites
+WHEN EXISTS (
+    SELECT 1 FROM sites s
+    WHERE s.uid_start <= NEW.uid_end AND NEW.uid_start <= s.uid_end
+)
+BEGIN
+    SELECT RAISE(ABORT, 'site ranges overlap');
+END;
+
+-- A row's identifier must fall in the range of the site that owns it.
+-- The condition fires only when the registry KNOWS the owner: a site created
+-- mid-session may have its rows arrive before the registry row does, and
+-- rejecting them would deadlock the conversation.
+CREATE TRIGGER sync_users_bi_range BEFORE INSERT ON users
+WHEN EXISTS (
+    SELECT 1 FROM sites s
+    WHERE s.site_id = NEW.site
+      AND NOT (NEW.userid BETWEEN s.uid_start AND s.uid_end)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'userid outside own site range');
+END;
+```
+
+The `site` column itself is defaulted by the engine:
+
+```sql
+site TEXT NOT NULL DEFAULT (local_site())
+```
+
+Verified: a scalar function in a column `DEFAULT` is evaluated per insert, an explicit
+value overrides it, and a connection where the function is not registered fails closed.
+`ALTER TABLE … ADD COLUMN` rejects a non-constant default, so this form needs
+`CREATE TABLE`; for a table that already exists the crate offers an `AFTER INSERT`
+trigger that fills a NULL `site` — which does not fire on the `ON CONFLICT DO UPDATE`
+path, correctly, since that path leaves an existing row's `site` alone.
+
+The `sync_users_bi_range` trigger fires on the `ON CONFLICT DO UPDATE` path too, so the
+upsert is covered by the same rule.
+
+### The UDFs
 
 | Function | Signature | Returns |
 |---|---|---|
 | `sync_stamp()` | none | The node's next issued timestamp, as RFC 3339 text |
 | `sync_us(text)` | RFC 3339 text | The same instant as integer microseconds |
 | `sync_digest(...)` | the row's key, timestamp, status, purge_on and replicated values | The 16-byte digest |
+| `local_site()` | none | The local node's `site_id` — only on tables with allocated identifiers |
 
 `sync_stamp()` is the monotonic-issuance mechanism (see below). `sync_us()` avoids
 parsing the timestamp back out of text inside SQLite. `sync_digest()` takes the row's
 values as arguments because it must hash exactly the replicated column set, in the
-registered order.
+registered order. `local_site()` is what populates the `site` column, so the application
+never writes it.
 
 ### Behaviour
 
@@ -417,6 +490,12 @@ assumed. These results are the basis for the design.
 | 13 | Can a trigger's `WHEN` clause reference a `temp` table? | **No.** `triggers cannot reference objects in database temp`. A guard marker must live in the main database. |
 | 14 | Can a `BEFORE DELETE` trigger convert a hard delete into a soft delete? | **Yes.** `UPDATE` the row to `status='deleted'`, then `SELECT RAISE(IGNORE)` to skip the physical delete. The statement succeeds; the row survives as a tombstone. |
 | 15 | Can the same trigger let the crate's legitimate purge through? | **Yes.** Gate the `WHEN` clause on a main-database marker table that the crate sets around its own purge statement. Verified: an app hard-delete is converted to a soft delete, a second app hard-delete of the tombstone is blocked, and the crate's purge removes the row. |
+| 16 | Can a trigger read a table in an `ATTACH`ed database? | **No.** `trigger users_range cannot reference objects in database reg`. The site registry must live in the main database. |
+| 17 | Can a scalar function be used in a column `DEFAULT`? | **Yes.** Evaluated per insert; an explicit value overrides it; a connection without the function fails closed (`no such function: local_site`). |
+| 18 | Can `ALTER TABLE … ADD COLUMN` use a non-constant default? | **No.** Rejected by SQLite. The `DEFAULT (fn())` form needs `CREATE TABLE`; an existing table uses an `AFTER INSERT` trigger instead. |
+| 19 | Does an `AFTER INSERT` trigger fire on the `ON CONFLICT DO UPDATE` path? | **No.** Correct — that path leaves an existing row's value alone. |
+| 20 | Can a range-enforcement trigger fire only when the owner is known? | **Yes.** `WHEN EXISTS (SELECT 1 FROM sites WHERE site_id = NEW.site AND NOT (… BETWEEN …))` — an unknown owner does not fire, so a site created mid-session does not deadlock the conversation. |
+| 21 | Can a registry trigger reject an overlapping range, and a second one freeze a range? | **Yes / yes.** `BEFORE INSERT` rejects overlap; `BEFORE UPDATE` rejects a range change while allowing descriptive updates. |
 
 Consequences that follow directly:
 

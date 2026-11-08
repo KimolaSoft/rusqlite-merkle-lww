@@ -141,6 +141,42 @@ language can implement the same format.
 - Handshake rejection cases: epoch mismatch, seed mismatch, unknown peer, stale peer,
   restricted column request.
 
+### 16. Bulk apply
+
+- A 50,000-row batch applies without exceeding SQLite's bound-parameter limit.
+- The chunk size adapts to the column count: `rows × columns ≤ 32,766` for every chunk,
+  at several table widths.
+- A bulk apply is **atomic** — a failure part-way through leaves nothing applied, and
+  the `_sync_log` is consistent with the user table.
+- The LWW filter works in the upsert: an older incoming row does not overwrite a newer
+  one.
+- The digest tie-break is applied in Rust: an equal timestamp with a higher digest wins,
+  consistently on both peers.
+- All three bulk paths (chunked `VALUES`, JSON, staging table) produce identical
+  results.
+- The JSON path requires `FROM json_each(?1) AS j` and `WHERE true` before
+  `ON CONFLICT` — asserted, so a refactor cannot silently break it.
+
+### 17. Site registry and allocation
+
+- **The range check**: an identifier inside the row's own site's range is accepted; one
+  outside it is refused — on the plain `INSERT` path and on the `ON CONFLICT DO UPDATE`
+  path.
+- **A peer's rows are accepted on the same terms**: a row whose owner is a different site
+  is inserted without complaint.
+- **An unknown owner is deferred**: a row whose owner is not yet in the registry is
+  accepted, and is re-validated once the registry catches up.
+- **The registry enforces its own invariants**: an overlapping range is refused on insert,
+  a range change is refused on update, a descriptive update is accepted, and a duplicate
+  `uid_start` is refused.
+- **The `site` column is filled by the engine**: an insert that omits it gets the local
+  site; an explicit value wins; a connection without the UDF fails closed.
+- **The allocator never reissues an identifier**: after a crash and restart, the next
+  allocated id is strictly greater than every previously allocated one, and a rolled-back
+  insert leaves a gap rather than a reusable id.
+- **A decommissioned site's range is retired**: after the site is soft-deleted, its range
+  is never reissued.
+
 ## Testing the SQLite mechanics
 
 The behaviour in [sqlite-interface.md](sqlite-interface.md) § "Verified SQLite behaviour"
@@ -154,7 +190,10 @@ and the design leans on several subtle points:
 - the authorizer can deny a write to a single column;
 - a nested `UPDATE` in a trigger recurses unless guarded;
 - a UDF-calling trigger fails on a connection where the UDF is not registered;
-- `unixepoch('now','subsec')` is millisecond-resolution.
+- `unixepoch('now','subsec')` is millisecond-resolution;
+- a trigger cannot reference an object in an attached database;
+- `ALTER TABLE … ADD COLUMN` rejects a non-constant default;
+- an `AFTER INSERT` trigger does not fire on the `ON CONFLICT DO UPDATE` path.
 
 A test that asserts each of these will fail loudly if a future SQLite version changes
 the behaviour the design depends on, rather than failing mysteriously later.
@@ -181,8 +220,8 @@ Each phase of [../PLAN.md](../PLAN.md) is measured against these suites:
 
 | Phase | Must pass |
 |---|---|
-| 0 — Foundations | 14 |
-| 1 — Store and enforcement | 2, 3, 13 |
+| 0 — Foundations | 14, and the allocator's "never reused" property |
+| 1 — Store and enforcement | 2, 3, 13, 17 |
 | 2 — Merkle tree | tree units, and the incremental-vs-rebuild property |
 | 3 — Diff engine | 1, 8, 9 |
 | 4 — Transport | 12, 15 |
@@ -201,22 +240,6 @@ instances, each with its own SQLite file, exchanging through an in-memory transp
 That requires the transport to be abstracted behind a trait rather than being HTTP-only.
 This is a design constraint that should be honoured in the implementation: **the sync
 engine must not depend on axum.**
-
-### 16. Bulk apply
-
-- A 50,000-row batch applies without exceeding SQLite's bound-parameter limit.
-- The chunk size adapts to the column count: `rows × columns ≤ 32,766` for every chunk,
-  at several table widths.
-- A bulk apply is **atomic** — a failure part-way through leaves nothing applied, and
-  the `_sync_log` is consistent with the user table.
-- The LWW filter works in the upsert: an older incoming row does not overwrite a newer
-  one.
-- The digest tie-break is applied in Rust: an equal timestamp with a higher digest wins,
-  consistently on both peers.
-- All three bulk paths (chunked `VALUES`, JSON, staging table) produce identical
-  results.
-- The JSON path requires `FROM json_each(?1) AS j` and `WHERE true` before
-  `ON CONFLICT` — asserted, so a refactor cannot silently break it.
 
 ## Property tests elsewhere
 

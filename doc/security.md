@@ -153,6 +153,20 @@ recomputes it, and does not need to.
 The consequence is that the digest seed is **deployment-wide state**, and a mismatch
 between trusted peers is fatal at handshake (`DIGEST_SEED_MISMATCH`).
 
+### The site registry is deployment-wide state too
+
+The `sites` registry — the table mapping each site to its identifier range — is the same
+kind of state as the seed and the epoch. It is not secret, but it is shared, and a node
+that lacks it cannot validate the identifiers it receives.
+
+It travels in the **join bundle**, alongside the epoch and the seed, and is exchanged
+before any data in every session. A peer presenting a different registry is a deployment
+error, and the range check will reject the affected rows.
+
+The registry is also the one place where the deployment's *structure* is visible: which
+sites exist, and which identifiers belong to which of them. A client that should not see
+that can mark the `sites` table `client_visible = false`.
+
 ### A client that cannot write
 
 A client holds projections, not full rows. If it could write, it could not recompute the

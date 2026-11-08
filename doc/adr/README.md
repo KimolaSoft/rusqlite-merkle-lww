@@ -24,7 +24,8 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | [0009](0009-progress-has-no-eta.md) | Progress is X-of-Y; no ETA in the protocol | accepted |
 | [0010](0010-no-orm-query-wrapper.md) | No ORM; the crate owns the connection, not the query language | accepted |
 | [0011](0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport | accepted |
-| [0012](0012-sync-key-is-separate-from-the-primary-key.md) | The sync key is separate from the application's primary key | accepted |
+| [0012](0012-sync-key-is-the-applications-key.md) | The sync key is the application's key when it is globally unique and stable | accepted |
+| [0013](0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier | accepted |
 
 ## Status values
 

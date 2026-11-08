@@ -50,6 +50,8 @@ encoding.
   `row_hash`.
 - `time.rs`: RFC 3339 parsing and formatting at fixed six-digit precision; the
   monotonic issuance guard.
+- `allocator.rs`: the globally-unique id allocator — per-site ranges and a durable
+  monotonic counter.
 - `error.rs`: the error type, including the protocol error codes.
 - `SecretString`: a wrapper whose `Debug` does not print its contents.
 
@@ -61,12 +63,29 @@ encoding.
   with the persisted value loaded at startup and written back on change.
 - The canonical encoding is the one thing that must not change once data exists. Get it
   right now.
-- **`KeyStrategy::Derived` needs a deterministic id derivation.** `uuidv5` over a
-  per-table namespace and the identity columns. The namespace must be stable across the
-  deployment, and configurable if data must move between deployments.
+- **`KeyStrategy::GlobalId` uses the application's own column** when it is already globally
+  unique and stable, so no extra column is added. `Derived` covers the applications that
+  cannot offer one.
+- **The id allocator guarantees "never reused".** Allocation is durable and happens
+  *before* use: a gap is harmless, a reuse is corruption. The counter must not roll back
+  with a transaction, so it is advanced outside the insert's transaction.
 - **Local columns are excluded from the digest**, not merely from the merge. Including
   them would make two peers holding the same entity compute different digests, so every
   bucket would differ and nothing would ever converge.
+- The range-allocation table is **deployment-wide state**, like the epoch and the digest
+  seed, because peers need it to validate the identifiers they receive. It is the
+  replicated **`sites` registry**, and it must live in the **main database** — triggers
+  cannot reference an attached database.
+- **The registry's range is immutable.** A site is renamed; its range is not moved. A
+  decommissioned site's range is retired forever, like a retired identifier.
+- **A row names the site that owns its identifier, not the site that last wrote it.** The
+  `site` column is replicated and in the digest; the range check is keyed on it, so a
+  peer's rows are accepted on the same terms as local ones.
+- **The range check fires only when the registry knows the owner.** A site created
+  mid-session may have its rows arrive before the registry row does; rejecting them would
+  deadlock the conversation, so they are accepted provisionally and re-validated later.
+- **The registry is exchanged before the data** in every session, and is part of the join
+  bundle alongside the epoch and the digest seed.
 
 ### Exit criteria
 
@@ -78,8 +97,18 @@ encoding.
   lexicographically in chronological order.
 - **The derived sync id is deterministic**: the same identity columns produce the same
   id on every node, and different identity columns produce different ids.
+- **The allocator never reissues an identifier**: after a crash and restart, the next
+  allocated id is strictly greater than every previously allocated one.
+- **The range check rejects a bad mint and accepts a peer's rows**: an identifier outside
+  the row's own site's range is refused, and one inside it is accepted — including on the
+  `ON CONFLICT DO UPDATE` path.
+- **The registry enforces its own invariants**: an overlapping range is refused on insert,
+  a range change is refused on update, and a descriptive update is accepted.
+- **The `site` column is filled by the engine, not the application**: an insert that
+  omits it gets the local site, an explicit value wins, and a connection without the UDF
+  fails closed.
 
-**Test suites:** 14 (canonical encoding).
+**Test suites:** 14 (canonical encoding), plus the allocator and registry suites.
 
 ---
 
@@ -100,8 +129,12 @@ verified experimentally rather than documented (see
 - `authorizer.rs`: the denial rules, the `accessor` exemption, and the per-connection
   privilege flag.
 - `log.rs`: `_sync_log` reads and writes.
+- `registry.rs`: the site registry — the replicated `sites` table, its immutable-range and
+  no-overlap triggers, the per-row range-enforcement trigger, and the `site` column
+  default.
 - DDL management: `create_table`, `alter_table`, `adopt_table`, `drop_table`.
-- The three UDFs: `sync_stamp()`, `sync_us(text)`, `sync_digest(...)`.
+- The UDFs: `sync_stamp()`, `sync_us(text)`, `sync_digest(...)`, and — on tables with
+  allocated identifiers — `local_site()`.
 
 ### Notes
 
@@ -113,6 +146,16 @@ verified experimentally rather than documented (see
 - **Every DDL path reinstalls the triggers** and rebuilds the tree.
 - The compatible dialect's staging table and drainer are implemented here, since they
   are part of the write path.
+- **The registry lives in the main database.** SQLite forbids a trigger from referencing
+  an object in an attached database, so a separate `sites.db` is not an option while the
+  range check is a trigger.
+- **The `site` column defaults to `local_site()`**, so the application never writes it.
+  `ALTER TABLE … ADD COLUMN` rejects a non-constant default, so the `DEFAULT (fn())` form
+  needs `CREATE TABLE`; for an existing table the crate installs an `AFTER INSERT`
+  backfill trigger and backfills the rows.
+- **The range trigger fires only when the registry knows the row's owner.** A site
+  created mid-session may have its rows arrive before the registry row does; rejecting
+  them would deadlock the conversation.
 
 ### Exit criteria
 
@@ -125,8 +168,14 @@ verified experimentally rather than documented (see
 - A raw `INSERT` on a managed table from an instrumented connection results in a
   stamped row and a correct `_sync_log` entry, verified by inspecting the database
   directly rather than through the crate's API.
+- **The registry enforces its invariants**: an overlapping range is refused on insert, a
+  range change is refused on update, and a descriptive update is accepted.
+- **The range check rejects a bad mint, accepts a peer's rows, and defers an unknown
+  owner** — including on the `ON CONFLICT DO UPDATE` path.
+- **The `site` column is filled by the engine**: an insert that omits it gets the local
+  site, an explicit value wins, and a connection without the UDF fails closed.
 
-**Test suites:** 2, 3, 13.
+**Test suites:** 2, 3, 13, plus the registry suite.
 
 ---
 
@@ -367,9 +416,12 @@ These are unresolved, and the ones marked **blocking** hold up a specific phase.
 | 6 | **Is the purge period daily, or aligned to the retention window?** Daily gives predictable instants; aligned to retention makes tombstones live exactly 30 days. | Purge cadence | Phase 5 |
 | 7 | **Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?** Only staged rows, presumably, but a row written and deleted within one interval is lost — acceptable, since it was never visible to a peer. | Drain semantics | Phase 1 |
 | 8 | **Should `AppendOnly` tables exist?** They remove the delete machinery from the trigger set, at the cost of a second code path. | Scope of the trigger set | Phase 1 |
-| 9 | **Should the crate manage the `sync_id` column, or require the application to provide it?** | Schema ownership | Phase 1 |
+| 9 | ~~Should the crate manage the `sync_id` column, or use the application's own key?~~ | **Resolved: the application's own key.** The application's `userid` is already globally unique and never reused, so it *is* the sync key and no extra column is needed. `Derived` covers applications whose key is local or mutable. See [ADR-0012](doc/adr/0012-sync-key-is-the-applications-key.md) | — |
 | 10 | **How is the derivation namespace chosen?** A per-table constant from the table name and `epoch_us` keeps ids stable within a deployment but differs between deployments. | Id stability | Phase 0 |
-| 11 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | Phase 6 |
+| 11 | **Should the crate own the id allocator?** The "never reused" property needs a durable, monotonic, pre-allocated counter and a range check. Owning it makes the property a guarantee rather than a convention. | API scope | Phase 0 |
+| 12 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | Phase 6 |
+| 13 | **Who assigns the site ranges, and how?** The crate cannot prevent two nodes from concurrently creating sites with overlapping ranges — each check passes locally, and the merge happens afterwards. Central assignment plus local enforcement is the current answer; a crate-side allocator is a possible extension. | Deployment invariant | Phase 0 |
+| 14 | **Is the `site` column's owner id an opaque id or a readable slug?** A slug is nicer to read and awkward to keep immutable; an opaque id is the reverse. The application owns the `sites` schema, so this is the application's choice — but the crate must not assume a slug is stable. | Schema ownership | Phase 0 |
 
 Questions 1 and 3 change the shape of the code. The rest can be settled during the phase
 they affect.

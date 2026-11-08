@@ -104,7 +104,8 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | [0009](adr/0009-progress-has-no-eta.md) | Progress is X-of-Y; no ETA in the protocol |
 | [0010](adr/0010-no-orm-query-wrapper.md) | No ORM; the crate owns the connection, not the query language |
 | [0011](adr/0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport |
-| [0012](adr/0012-sync-key-is-separate-from-the-primary-key.md) | The sync key is separate from the application's primary key |
+| [0012](adr/0012-sync-key-is-the-applications-key.md) | The sync key is the application's key when it is globally unique and stable |
+| [0013](adr/0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier |
 
 ## Conventions used throughout
 
@@ -125,7 +126,7 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | **digest** | xxh3-128 over a row's replicated content, keyed with the deployment seed |
 | **row hash** | The value folded into a bucket hash; covers key, timestamp, status, digest |
 | **managed table** | A table the crate syncs, and for which it owns columns, triggers and DDL |
-| **managed column** | A column the crate owns: `sync_id`, `last_update`, `status`, `purge_on` |
+| **managed column** | A column the crate owns: `last_update`, `status`, `purge_on`, and sometimes the key column |
 | **dialect** | Which trigger flavour is in use: *enforced* (Rust UDF) or *compatible* (pure SQL) |
 | **quiesce window** | The interval around a purge instant during which sync is refused |
 | **purge instant** | The globally scheduled moment at which tombstones are removed |

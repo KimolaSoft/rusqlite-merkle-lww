@@ -165,7 +165,8 @@ part of the digest.
 ### Managed column names
 
 The four crate-owned columns can be renamed per table, for tables whose existing schema
-uses different names. The defaults are `sync_id`, `last_update`, `status`, `purge_on`.
+uses different names. The defaults are `last_update`, `status` and `purge_on`, plus a
+key column (`sync_id`) when the application has no usable key of its own.
 
 ## Peers
 

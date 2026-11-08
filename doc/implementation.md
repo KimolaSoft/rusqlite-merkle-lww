@@ -58,38 +58,94 @@ let config = SyncConfig {
 let spec = TableSpec {
     name: "users".into(),
     kind: TableKind::Keyed,
-    key: KeyStrategy::Derived {
-        identity_columns: vec!["email".into()],
-        prefix: Some("user".into()),
+    key: KeyStrategy::GlobalId {
+        // Your own column, already globally unique and never reused.
+        key_columns: vec!["userid".into()],
     },
     columns: vec![
-        ColumnSpec { name: "userid".into(),   replicated: true, visibility: Visibility::Public,
-                     local: true, merge: MergeMode::LastWriteWins },
-        ColumnSpec { name: "username".into(), replicated: true, visibility: Visibility::Public,
+        ColumnSpec { name: "userid".into(),  replicated: true, visibility: Visibility::Public,
                      local: false, merge: MergeMode::LastWriteWins },
-        ColumnSpec { name: "email".into(),    replicated: true, visibility: Visibility::Public,
+        ColumnSpec { name: "site".into(),    replicated: true, visibility: Visibility::Public,
                      local: false, merge: MergeMode::LastWriteWins },
-        ColumnSpec { name: "secret".into(),   replicated: true, visibility: Visibility::Restricted,
+        ColumnSpec { name: "username".into(),replicated: true, visibility: Visibility::Public,
+                     local: false, merge: MergeMode::LastWriteWins },
+        ColumnSpec { name: "email".into(),   replicated: true, visibility: Visibility::Public,
+                     local: false, merge: MergeMode::LastWriteWins },
+        ColumnSpec { name: "secret".into(),  replicated: true, visibility: Visibility::Restricted,
                      local: false, merge: MergeMode::LastWriteWins },
     ],
     client_visible: true,
+    allocation: Some(AllocationSpec {
+        id_column:      "userid".into(),
+        site_column:    "site".into(),
+        registry_table: "sites".into(),
+    }),
 };
 ```
 
-Three things to get right here:
+**If your key is already globally unique and stable, that is the sync key** — the crate
+adds no key column, and `ON CONFLICT (userid)` is the conflict target.
 
-**The sync key is separate from your primary key.** The crate manages a `sync_id` column,
-derived from the identity columns. Your `userid INTEGER PRIMARY KEY` stays exactly as it
-is — a local sequence that only means something on the site that issued it. That is why
-`userid` is marked `local: true`: a remote write never overwrites it.
+That means `userid` must be globally unique across the whole deployment and never reused.
+The usual way to get that is a per-site range:
 
-**The identity columns must be stable.** `sync_id` is the entity's identity, so deriving
-it from `email` means an email change is a *move* rather than an update. If email is
-mutable in your app, derive from something immutable instead.
+```
+site 1 → 10000 … 19999
+site 2 → 20000 … 29999
+```
 
-**For the same user to be the same user across sites, the derivation must be
-deterministic** — which `Derived` is. A randomly generated id at each site would not
-merge. See [data-model.md](data-model.md) § "Getting the id right".
+**The ranges live in a `sites` registry table**, which you create in the same database as
+your data:
+
+```sql
+CREATE TABLE sites (
+    site_id     TEXT    NOT NULL,      -- immutable, globally unique — THE SYNC KEY
+    site_name   TEXT    NOT NULL,      -- mutable display name
+    uid_start   INTEGER NOT NULL,
+    uid_end     INTEGER NOT NULL,
+    city        TEXT,
+    country     TEXT,
+    last_update TEXT    NOT NULL,
+    status      TEXT    NOT NULL,
+    purge_on    TEXT,
+    PRIMARY KEY (site_id),
+    CHECK (uid_start <= uid_end)
+);
+```
+
+It must be in the **same database** as your data — SQLite forbids a trigger from
+referencing an object in an attached database, and the range check is a trigger.
+
+**Your table needs a `site` column**, naming the site that owns the identifier. The crate
+fills it; you never write it:
+
+```sql
+CREATE TABLE users (
+    userid      INTEGER PRIMARY KEY,
+    site        TEXT    NOT NULL DEFAULT (local_site()),
+    username    TEXT    NOT NULL,
+    email       TEXT    NOT NULL,
+    last_update TEXT    NOT NULL DEFAULT (sync_stamp()),
+    status      TEXT    NOT NULL DEFAULT 'live',
+    purge_on    TEXT
+);
+```
+
+Note `site` names the **owner** of the identifier, not the site that last wrote the row.
+When another site edits one of your users, `site` stays yours and only `last_update`
+moves.
+
+> If the table already exists, `ALTER TABLE … ADD COLUMN` cannot use a non-constant
+> default, so `DEFAULT (local_site())` is only available in `CREATE TABLE`. For an
+> existing table, ask the crate for the `AFTER INSERT` backfill trigger and backfill the
+> existing rows.
+
+**If your key is only locally unique** — an integer sequence, or a mutable one like an
+email — use `KeyStrategy::Derived` instead, and the crate manages a derived column.
+
+**Mark local columns.** A column whose value is meaningful only on the site that wrote it
+— a local counter, a site-specific flag — should be `local: true`. A remote write never
+overwrites it, and it is excluded from the digest so that peers can still converge.
 
 For a table whose rows are genuinely per-site, use `KeyStrategy::SiteNamespaced` instead.
 
@@ -173,7 +229,7 @@ UPDATE users SET username = 'alice2', last_update = '2024-01-01T00:00:00.000000Z
 
 ### Do not write the managed columns
 
-`status`, `purge_on` and `sync_id` are crate-managed. Use `Db::delete()` for a delete:
+`status` and `purge_on` are crate-managed. Use `Db::delete()` for a delete:
 
 ```rust
 db.delete("users", &key)?;       // sets status and purge_on
@@ -182,8 +238,44 @@ db.delete("users", &key)?;       // sets status and purge_on
 A raw `DELETE` is converted to a soft delete by a trigger, and a raw write to `status` is
 rejected by the authorizer on instrumented connections.
 
-Writing `sync_id` directly would break the identity of the row — the crate derives it from
-the identity columns and would overwrite your value on the next write.
+If the crate manages a key column (`Derived`, `SiteNamespaced` or `Surrogate`),
+writing it directly breaks the identity of the row — the crate derives it and would
+overwrite your value on the next write.
+
+**Do not write the `site` column either.** It names the site that *owns* the identifier,
+and the engine fills it with `local_site()`. Writing it by hand is how a row ends up
+claiming an owner whose range does not contain its identifier — the range trigger will
+reject the write, which is the correct outcome, but it is easier not to create the
+problem.
+
+### Do not move a site's range
+
+`uid_start` and `uid_end` are immutable. A site is renamed; its range is not moved.
+
+Moving a range would invalidate every identifier already minted under it, and there is no
+support in this design for re-allocating a site's identifiers. If a site needs a bigger
+range, give it a second one — or retire it and create a new site.
+
+Assign ranges centrally. Two nodes creating sites concurrently can each accept a range
+that overlaps the other's, because each check passes locally and the merge happens
+afterwards. The crate's `sites_no_overlap` trigger stops a malformed allocation entering
+the table, but it cannot make two independent decisions agree.
+
+### Do not reuse a globally unique identifier
+
+If your key is globally unique — a `userid` from a per-site range — an identifier must
+**never be reissued**, even after a crash. A gap is harmless; a reuse is corruption.
+
+Allocate durably, then use:
+
+```
+allocate (durable, own transaction) → use
+```
+
+not the other way round. If the insert is rolled back, the identifier is simply skipped.
+
+A decommissioned site's range is retired with it, and is never reissued — exactly like a
+retired identifier.
 
 ### Do not rely on a local column surviving a merge
 

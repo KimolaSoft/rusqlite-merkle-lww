@@ -37,10 +37,23 @@ differing rows and receives the peer's — so there is no separate push API.
                                "visibility": "public" },
                              { "name": "secret", "replicated": true,
                                "visibility": "restricted" } ],
+                "client_visible": true },
+              { "name": "sites",
+                "kind": "keyed",
+                "key": { "strategy": "global_id",
+                         "key_columns": ["site_id"] },
+                "columns": [ { "name": "uid_start", "replicated": true,
+                               "visibility": "public" },
+                             { "name": "uid_end", "replicated": true,
+                               "visibility": "public" } ],
                 "client_visible": true } ],
   "schema_hash": "…"
 }
 ```
+
+The `sites` registry is listed like any other table, but it is **not optional**: it is
+exchanged first in every session, and a node that has never synced receives it as part of
+the join bundle rather than by syncing. See § "REGISTRY".
 
 ### Validation
 
@@ -63,11 +76,32 @@ sides choose identical depths.
 
 ```
 1. HELLO     client → server
-2. SUMMARY   exchange bucket hashes for a range
-3. DETAIL    exchange child hashes for the buckets that differ
-4. ROWS      exchange the differing rows
-5. COMMIT    advance the cursor
+2. REGISTRY  exchange the site registry
+3. SUMMARY   exchange bucket hashes for a range
+4. DETAIL    exchange child hashes for the buckets that differ
+5. ROWS      exchange the differing rows
+6. COMMIT    advance the cursor
 ```
+
+### REGISTRY
+
+The site registry is exchanged **before** any data, and applied before any data is
+accepted.
+
+The reason is the range check. A node cannot validate an identifier it has no range for,
+so the registry must be current before a row arrives. It is also the reason the registry is
+part of the join bundle: a node that has never synced has no ranges at all, and cannot
+decide whether a row's identifier belongs to a site it has not heard of.
+
+The phase is a normal table sync — the same SUMMARY/DETAIL/ROWS machinery, over the
+`sites` table — run first, and it runs unconditionally at the start of a session, even
+when the registry itself has not changed. A session that omits it would accept rows whose
+owners it does not know, which the range trigger defers rather than rejects.
+
+For a site created *during* a session, the registry row may reach the peer after the
+site's data rows do. The range trigger fires only when the registry knows the row's
+owner, so such a row is accepted provisionally and re-validated when the registry catches
+up.
 
 ### SUMMARY
 
