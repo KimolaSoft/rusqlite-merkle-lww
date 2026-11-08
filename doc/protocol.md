@@ -47,7 +47,11 @@ differing rows and receives the peer's — so there is no separate push API.
                              { "name": "uid_end", "replicated": true,
                                "visibility": "public" } ],
                 "client_visible": true } ],
-  "schema_hash": "…"
+  "schema_hash": "…",
+  "codec_version": 1,
+  "directory": [ { "node_id": "…", "role": "master" },
+                 { "node_id": "…", "role": "child",
+                   "parent_id": "…" } ]
 }
 ```
 
@@ -55,18 +59,43 @@ The `sites` registry is listed like any other table, but it is **not optional**:
 exchanged first in every session, and a node that has never synced receives it as part of
 the join bundle rather than by syncing. See § "REGISTRY".
 
+### The directory in the handshake
+
+Every master sends the UUID directory it holds, and every master takes the **union**. That
+is how provisioning a child makes it known to the whole mesh without an operator editing
+each config file.
+
+**A child never receives the directory.** It sends only its own entry, and learns only
+its upstream master's UUID. A child that learned another child's UUID could present
+`(that UUID, the child string)` and be accepted as that child — the child string is
+shared by all children, so the UUID is the only thing distinguishing them. The directory
+is the child security boundary, and the handshake is where it is withheld.
+
+A client sends no directory and receives none.
+
 ### Validation
 
 | Check | Failure |
 |---|---|
 | `epoch_us` differs | `EPOCH_MISMATCH` — fatal; the trees are not comparable |
 | `protocol` differs | `PROTOCOL_UNSUPPORTED` |
+| `codec_version` differs | `CODEC_MISMATCH` — fatal; the encoding changed, so every digest changed |
 | `digest_seed` differs (trusted peers) | `DIGEST_SEED_MISMATCH` — fatal; every row hash differs |
-| `node_id` not in the peer list | `UNKNOWN_PEER` |
+| `schema_hash` differs (trusted peers) | `SCHEMA_MISMATCH` — fatal; the digest inputs differ |
+| `node_id` not in the directory | `UNKNOWN_PEER` |
+| credential does not verify for the claimed role | `BAD_CREDENTIAL` |
 | `as_of_us` differs by more than the tolerance | the server's wins; the client adopts it |
 | `last_purge_instant` — peer is older than ours | `STALE_PEER` (see [lifecycle.md](lifecycle.md)) |
 | peer requests a `Restricted` column | `COLUMN_NOT_PERMITTED` |
-| unknown `tables`/`columns` | sync the intersection, log a warning |
+| unknown `tables`/`columns`, **client** session | sync the intersection, log a warning |
+| unknown `tables`/`columns`, **trusted peer** | `SCHEMA_MISMATCH` — fatal |
+
+The last two rows are not in conflict, and the distinction matters. A read-only client
+legitimately sees a narrower schema — only the public projection — so the intersection is
+the right behaviour. A **trusted peer** that disagrees about the replicated column set
+would compute different digests for the same logical row, and the trees would never
+converge. That is not a warning; it is fatal. The `schema_hash` is what makes the
+difference detectable.
 
 `as_of_us` is the single timestamp driving the comparison-depth policy and the "what
 changed since" computation. In a client→server session the server supplies it, so both
@@ -177,8 +206,24 @@ apply(incoming, local):
         else                                       -> keep local
 ```
 
-The tie-break on `digest` only matters on an exact microsecond collision. Both peers hold
-the same digest for the same row, so they reach the same conclusion.
+The tie-break fires on an **exact** `last_update` collision. That is not a theoretical
+edge case: our timestamps are microsecond-resolution, but the clock underneath may be
+coarser, and two nodes genuinely writing at the same instant is routine. When it
+happens, the two nodes wrote **different data** — this is a real conflict, not a
+duplicate write.
+
+The digest covers the payload, so the two rows have different digests, and the comparison
+resolves them. The digest is 16 bytes, big-endian on the wire, and compared as an
+**unsigned 128-bit integer**:
+
+```
+incoming.digest > local.digest   →   incoming_u128 > local_u128
+```
+
+Comparing the raw bytes in memory order would let two peers disagree on a tie, and each
+would keep a different row — permanent divergence, invisible until it caused one.
+
+Both peers hold the same digest for the same row, so they reach the same conclusion.
 
 Because the digest is keyed, only trusted peers can compute it. A client never performs
 the tie-break — it applies what the server sends.
@@ -325,6 +370,49 @@ route count matters more than clarity.
 A client that only ever receives can use a simplified flow: `HELLO` → the server sends
 the full diff proactively → the client applies → `COMMIT`. The client does not compute
 symmetric differences, and the server drives the progress report directly.
+
+## Error codes
+
+Every failure the protocol can report, in one place. The wire carries the code as a
+stable string; the numeric value is an implementation detail.
+
+### Fatal — the session cannot proceed
+
+| Code | Meaning | Typical cause |
+|---|---|---|
+| `PROTOCOL_UNSUPPORTED` | The peer speaks a different protocol version | Version skew |
+| `CODEC_MISMATCH` | The canonical encoding differs | A crate upgrade on one side |
+| `EPOCH_MISMATCH` | The bucket epoch differs | The deployment was provisioned inconsistently |
+| `DIGEST_SEED_MISMATCH` | The digest seed differs | The wrong seed, or a rotation that did not reach everyone |
+| `SCHEMA_MISMATCH` | The digest inputs differ | A column was added, removed or reordered on one side |
+| `UNKNOWN_PEER` | The presented UUID is not in the directory | Not provisioned, or revoked |
+| `BAD_CREDENTIAL` | The credential does not verify for the claimed role | Wrong secret, or a rotated one |
+| `STALE_PEER` | The peer is older than the purge floor | The peer was down across a purge instant |
+
+Every one of these is a **correctness** failure, not a policy difference: continuing
+would mean comparing trees that cannot be compared, or accepting writes from a node that
+should not be writing.
+
+### Non-fatal — the session continues with a caveat
+
+| Code | Meaning | Handling |
+|---|---|---|
+| `COLUMN_NOT_PERMITTED` | A peer asked for a `Restricted` column | The column is dropped; the request is logged |
+| `TABLE_NOT_PERMITTED` | A peer asked for a `client_visible = false` table | The table is dropped |
+| `UNKNOWN_TABLE` | A peer named a table this node does not sync | Client sessions: sync the intersection. Trusted peers: `SCHEMA_MISMATCH` |
+| `UNKNOWN_COLUMN` | A peer named a column this node does not have | As above |
+| `RANGE_VIOLATION` | A row's identifier is outside its owner's range | The row is refused; the write is logged |
+| `KEY_CONFLICT` | Two rows in one batch carry the same key | The batch is refused; it is a bug in the sender |
+| `PROGRESS_STALE` | A progress report is older than the cursor | Ignored |
+
+### Local — the crate's own failures
+
+| Code | Meaning |
+|---|---|
+| `IDENTIFIER_REUSED` | The allocator handed out an identifier it had already used |
+| `OVERLAPPING_RANGES` | A site's range overlaps another site's |
+| `RANGE_IMMUTABLE` | An attempt to move a site's range |
+| `DIGEST_MISMATCH` | A stored digest does not match a recomputed one — a raw write bypassed the trigger |
 
 ## Related documents
 

@@ -106,6 +106,7 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | [0011](adr/0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport |
 | [0012](adr/0012-sync-key-is-the-applications-key.md) | The sync key is the application's key when it is globally unique and stable |
 | [0013](adr/0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier |
+| [0014](adr/0014-peer-credentials-and-the-uuid-directory.md) | Role-level credentials, a master-issued UUID directory, and a separate digest seed |
 
 ## Conventions used throughout
 

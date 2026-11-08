@@ -17,13 +17,20 @@ it asks for.
 ## Peer identity
 
 A peer needs a **stable identity** that means the same thing across restarts,
-redeployments, and TLS termination. Two layers:
+redeployments, and TLS termination. Three layers, each answering a different question.
+
+| Layer | Question it answers | Value |
+|---|---|---|
+| **Identity** | *who is this?* | a UUID, issued by a master |
+| **Directory** | *who exists, and may I address them?* | every node's UUID, masters only |
+| **Credential** | *may I talk to them?* | a role-level secret string |
+| **Digest seed** | *what key do I hash with?* | a third secret, not a credential |
 
 ### Layer 1 — the identity
 
 ```rust
 pub struct Peer {
-    pub node_id:   Uuid,             // stable, matches the handshake
+    pub node_id:   Uuid,             // stable; issued by a master
     pub name:      String,           // for logs and the UI
     pub role:      Role,
     pub endpoint:  String,           // https://…
@@ -31,39 +38,107 @@ pub struct Peer {
 }
 ```
 
-`node_id` is generated once and persisted in `_sync_meta`. It is the identity the sync
-protocol refers to.
+A node's `node_id` is **issued by a master** — minted when a master provisions a child,
+and by a master for itself at first start. It is persisted in `_sync_meta` and presented
+at handshake.
 
-### Layer 2 — the credential
+Issuing it is what makes the UUID meaningful within the deployment: a master vouches for
+it and can revoke it.
 
-A `node_id` alone is a **claim**, not a credential. The peer list is the trust boundary:
-a node that has never heard of a `node_id` will not talk to it, regardless of what the
-peer asserts.
+### Layer 2 — the directory
+
+Every master knows **every node's UUID** — its own, its children's, and other masters'
+children.
+
+The directory is **propagated master to master** at handshake: each master sends the
+directory it holds, and each takes the union. Provisioning a child therefore makes it
+known to the whole mesh, with no operator editing every config file.
+
+**Children are not given the directory.** A child knows its own UUID and its upstream
+master's. A client knows none.
+
+The directory is control-plane state, stored in `_sync_directory`, and is **not
+replicated** — not in `_sync_log`, not in the Merkle tree, not in any application table.
+
+### Layer 3 — the credential
+
+A `node_id` alone is a **claim**, not a credential. The directory is the trust boundary:
+a node whose UUID is not in the directory will not be talked to, regardless of what it
+asserts.
 
 ```rust
 pub enum PeerAuth {
-    /// Shared secret, compared in constant time. Simplest.
-    Token(SecretString),
+    /// A role-level shared secret, compared in constant time.
+    RoleSecret { role: Role, secret: SecretString },
+
     /// Client certificate subject/SAN, checked against the presented certificate.
     ClientCert { subject: String },
+
     /// Trust the transport: TLS is terminated elsewhere and mTLS is already verified.
     TransportOnly,
 }
 ```
 
-`SecretString` is a wrapper that does not implement `Debug` as its contents, so tokens do
+Two strings exist:
+
+| String | Held by | Authenticates |
+|---|---|---|
+| **master string** | every master | master ↔ master |
+| **child string** | every child, and every master | child ↔ master |
+
+`SecretString` is a wrapper that does not implement `Debug` as its contents, so secrets do
 not leak into logs or error messages. That is the whole reason to have it.
+
+Because the credentials are **role-level**, every master is cryptographically identical to
+every other master. The deployment gets **authorization and revocation**, but not
+**attribution** — nothing can prove which master wrote a given row. Per-node credentials
+or signing keys would be needed for that.
+
+### The directory is the child security boundary
+
+All children share the child string, so **the UUID is the only thing distinguishing one
+child from another**. A child that learned another child's UUID could present
+`(that UUID, the child string)` and be accepted as that child.
+
+This is exactly why the directory is withheld from children, and why it is control plane
+rather than replicated data: putting it in the dataset would put it in the hands of every
+child.
 
 ### The check
 
-At handshake, the node verifies that the presented `node_id` is in its configured peer
-list. An unknown identity is rejected with `UNKNOWN_PEER`.
+At handshake, the node verifies three things:
 
-The credential is checked separately, by whatever mechanism the deployment uses. The
-crate does not implement the credential check itself beyond comparing a token; it relies
-on the transport or the reverse proxy for certificate validation.
+1. the presented `node_id` is in its directory — otherwise `UNKNOWN_PEER`;
+2. the credential verifies for the role the peer claims — otherwise `BAD_CREDENTIAL`;
+3. the deployment state matches — epoch, digest seed, schema hash, codec version.
 
-See [ADR-0008](adr/0008-two-peer-identity-layers.md).
+The crate compares a token itself; certificate validation is the transport's job.
+
+### Mutual authentication with one secret
+
+A child must know it is talking to a real master, without holding the master string. It
+does not need to: the master proves itself by HMAC-ing the child's challenge with the
+**child string**, which the child also holds.
+
+```
+child  → master:  HELLO { uuid, nonce }
+master → child:   PROOF = HMAC(child_string, nonce ‖ child_uuid)
+child:            verify PROOF against its own child_string
+```
+
+### Secrets are not stored
+
+The digest seed and the role strings are supplied by the application as configuration.
+The crate holds them in memory for the life of the process and **writes none of them to
+the database** — including the digest seed, which an earlier revision stored in
+`_sync_meta`.
+
+The database is replicated, inspected, backed up and shipped around. It is the wrong place
+for the material that authenticates a peer. The consequence is that the crate has **no
+rotation logic**; rotation is an application concern, and an application that wants
+managed rotation can put a crate in front of this one.
+
+See [adr/0014-peer-credentials-and-the-uuid-directory.md](adr/0014-peer-credentials-and-the-uuid-directory.md).
 
 ## TLS
 
@@ -185,12 +260,35 @@ The design makes this structural rather than advisory:
 | Property | Requirement |
 |---|---|
 | Shared across trusted peers | Yes — a mismatch makes every row hash differ |
+| **Reached by children too** | Yes — a child writes rows, and every write produces a digest |
 | Absent from clients | Yes — otherwise restricted values are confirmable |
 | Rotation | Not supported in v1. Rotation requires a full re-digest, which means a full re-seed. |
 | Storage | The consumer's responsibility — env var, mounted secret, KMS |
 
-The crate stores it in `_sync_meta` and reads it from config. It does not implement a
-secret store.
+**The crate does not persist it.** It is supplied as configuration, held in memory for the
+life of the process, and never written to the database. An earlier revision stored it in
+`_sync_meta`; that was reversed.
+
+It is a **third value**, separate from the two credential strings, and it is rotated
+independently of them. Deriving it from a credential would couple a routine credential
+rotation to a full dataset rebuild — every stored digest and every tree leaf would
+change. See [adr/0014-peer-credentials-and-the-uuid-directory.md](adr/0014-peer-credentials-and-the-uuid-directory.md)
+§ 4.
+
+### The three secrets side by side
+
+| | Master string | Child string | Digest seed |
+|---|---|---|---|
+| **Purpose** | authenticate master ↔ master | authenticate child ↔ master | key the hash |
+| **A credential?** | yes | yes | **no** — it authenticates nothing |
+| **Masters have it** | yes | yes | yes |
+| **Children have it** | no | yes | yes |
+| **Clients have it** | no | no | no |
+| **Rotation cost** | re-provision the masters | re-provision the children | **full rebuild of every tree** |
+
+The digest seed cannot be the master string: children need it to digest their own writes,
+and children deliberately do not have the master string — that would let a child
+impersonate a master.
 
 ## Row-level integrity
 

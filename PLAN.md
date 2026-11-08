@@ -46,14 +46,22 @@ encoding.
 - `config.rs`: `SyncConfig`, `TableSpec`, `ColumnSpec`, `KeyStrategy`, `Visibility`,
   `TableKind`, `MergeMode`, `Peer`, `PeerAuth`, `CacheConfig`, `Role`, `WriteMode`. All
   `serde`-derived with `Default`.
-- `codec.rs`: canonical sync-id and value encoding; seeded xxh3 digest; the two-level
-  `row_hash`.
+- `codec.rs`: the canonical encoding — one tagged-value rule for both keys and values;
+  the seeded xxh3 digest; the two-level `row_hash`; the codec version.
+- `schema.rs`: the `schema_hash` — exactly the inputs to the row digest, including the
+  registered column order.
 - `time.rs`: RFC 3339 parsing and formatting at fixed six-digit precision; the
   monotonic issuance guard.
 - `allocator.rs`: the globally-unique id allocator — per-site ranges and a durable
   monotonic counter.
 - `error.rs`: the error type, including the protocol error codes.
+- `directory.rs`: the UUID directory — the local table, the handshake merge, and the
+  per-node revocation check.
 - `SecretString`: a wrapper whose `Debug` does not print its contents.
+
+**The crate persists no secret material.** The digest seed, the role strings and the peer
+list are configuration, held in memory for the life of the process. Nothing secret is
+written to the database, and the crate implements no rotation.
 
 ### Notes
 
@@ -72,6 +80,16 @@ encoding.
 - **Local columns are excluded from the digest**, not merely from the merge. Including
   them would make two peers holding the same entity compute different digests, so every
   bucket would differ and nothing would ever converge.
+- **The registered column order is part of the schema hash.** The digest concatenates
+  values in registration order, so a different order is a different digest for the same
+  logical row — permanent, silent divergence. The order is not an implementation detail.
+- **The digest is 16 bytes, big-endian on the wire, compared as a `u128`.** Comparing raw
+  bytes in memory order would let two peers disagree on an exact-timestamp tie.
+- **The `site` column is in the digest**, because it is replicated and both peers must
+  agree on it.
+- **The digest seed is a third value**, separate from the two credential strings and
+  rotated independently. Deriving it from a credential would couple a routine credential
+  rotation to a full dataset rebuild.
 - The range-allocation table is **deployment-wide state**, like the epoch and the digest
   seed, because peers need it to validate the identifiers they receive. It is the
   replicated **`sites` registry**, and it must live in the **main database** — triggers
@@ -107,6 +125,11 @@ encoding.
 - **The `site` column is filled by the engine, not the application**: an insert that
   omits it gets the local site, an explicit value wins, and a connection without the UDF
   fails closed.
+- **The key encoding is the value encoding**: `userid = 10001` produces the same tagged
+  bytes in `_sync_log.k`, in the digest input, and on the wire — and the same rule covers
+  a composite key.
+- **The schema hash covers exactly the digest's inputs**: two nodes differing only in
+  registered column order are rejected at handshake, not discovered as divergence.
 
 **Test suites:** 14 (canonical encoding), plus the allocator and registry suites.
 
@@ -422,6 +445,8 @@ These are unresolved, and the ones marked **blocking** hold up a specific phase.
 | 12 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | Phase 6 |
 | 13 | **Who assigns the site ranges, and how?** The crate cannot prevent two nodes from concurrently creating sites with overlapping ranges — each check passes locally, and the merge happens afterwards. Central assignment plus local enforcement is the current answer; a crate-side allocator is a possible extension. | Deployment invariant | Phase 0 |
 | 14 | **Is the `site` column's owner id an opaque id or a readable slug?** A slug is nicer to read and awkward to keep immutable; an opaque id is the reverse. The application owns the `sites` schema, so this is the application's choice — but the crate must not assume a slug is stable. | Schema ownership | Phase 0 |
+| 15 | ~~How is the peer credential structured?~~ | **Resolved.** Master-issued UUIDs; a UUID directory propagated master-to-master; role-level master and child strings; the digest seed as a third, independently-rotated value. Per-node revocation is by removing a UUID from the directory. Attribution is **not** available, because role-level credentials make masters indistinguishable. See [ADR-0014](doc/adr/0014-peer-credentials-and-the-uuid-directory.md) | — |
+| 16 | ~~Where does the digest seed live?~~ | **Resolved.** It is configuration, held in memory, and **never written to the database**. The crate implements no rotation. | — |
 
 Questions 1 and 3 change the shape of the code. The rest can be settled during the phase
 they affect.

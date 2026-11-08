@@ -26,6 +26,7 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | [0011](0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport | accepted |
 | [0012](0012-sync-key-is-the-applications-key.md) | The sync key is the application's key when it is globally unique and stable | accepted |
 | [0013](0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier | accepted |
+| [0014](0014-peer-credentials-and-the-uuid-directory.md) | Role-level credentials, a master-issued UUID directory, and a separate digest seed | accepted |
 
 ## Status values
 

@@ -41,15 +41,31 @@ for it.
 use merkle_lww_core::SyncConfig;
 
 let config = SyncConfig {
-    node_id:  Uuid::new_v4(),
+    node_id:  issued_uuid,            // issued by a master, not generated here
     site:     "eu-west".into(),
     epoch_us: 1735689600000000,      // shared across the deployment
     role:     Role::Master,
+    credential: Some(master_string),  // what this node presents
+    digest_seed: digest_seed,         // shared by every node that computes digests
     ..Default::default()
 };
 ```
 
-`epoch_us` and `digest_seed` must be identical across every trusted peer. See
+Three secrets, and they are not interchangeable:
+
+| Secret | Who has it | What it does |
+|---|---|---|
+| **master string** | every master | authenticates master ↔ master |
+| **child string** | every child; every master | authenticates child ↔ master |
+| **digest seed** | every master and every child | keys the hash — **not** a credential |
+
+The digest seed must reach **children** as well as masters: a child writes rows, and every
+write produces a digest. Clients get none of the three.
+
+**None of them is written to the database.** The crate holds them in memory and
+implements no rotation — that is your layer. See [security.md](security.md).
+
+`epoch_us` must be identical across every trusted peer, and so must `digest_seed`. See
 [config.md](config.md).
 
 ### 2. Describe your tables
@@ -293,6 +309,25 @@ local sequence collides with a different local row will fail to insert.
 
 These are internal. The authorizer rejects writes on instrumented connections, and the
 log guard rejects them on any connection.
+
+### Do not leak the UUID directory to a child
+
+The directory — every node's UUID — is the child security boundary. Every child shares
+the child string, so the UUID is the only thing distinguishing one child from another: a
+child that learned another child's UUID could present it and be accepted as that child.
+
+The crate sends a child only its own entry. If you build your own transport, do the
+same.
+
+### Do not put secrets in the database
+
+The crate writes none of them, and neither should you. The database is replicated,
+inspected, backed up and shipped around; it is the wrong place for the material that
+authenticates a peer. Keep the digest seed and the role strings in the environment, a
+mounted secret, or a KMS — and rotate them by rotating the configuration.
+
+Rotation of the digest seed is the expensive one: it re-digests every row, so it is a full
+rebuild of every tree. The role strings rotate cheaply.
 
 ### Do not expect a JSON array column to merge as a set
 

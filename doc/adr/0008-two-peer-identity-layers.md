@@ -68,6 +68,17 @@ The crate authenticates the peer with whatever credential the deployment already
 See [ADR-0011](0011-crate-provides-the-exchange.md) for the full division of
 responsibility between the crate and the application.
 
+## Amendment
+
+[ADR-0014](0014-peer-credentials-and-the-uuid-directory.md) extends this decision:
+
+- the `node_id` is **issued by a master**, not self-generated;
+- a **UUID directory** sits between identity and credential — every node's UUID, merged
+  across masters at handshake, and withheld from children;
+- the credential is **role-level** (a master string and a child string), not per-node;
+- the **digest seed** is a third value, separate from both credential strings and rotated
+  independently.
+
 ## Consequences
 
 **Positive**

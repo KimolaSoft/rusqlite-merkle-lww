@@ -35,9 +35,9 @@ All three were measured with 50,000 rows against an in-memory database.
 ### Path 1 — multi-row `VALUES` with bound parameters
 
 ```sql
-INSERT INTO device(sync_id, payload, last_update, status, purge_on)
+INSERT INTO device(key, payload, last_update, status, purge_on)
 VALUES (?,?,?,?,?), (?,?,?,?,?), …
-ON CONFLICT(sync_id) DO UPDATE SET
+ON CONFLICT(key) DO UPDATE SET
     payload     = excluded.payload,
     last_update = excluded.last_update,
     status      = excluded.status,
@@ -56,11 +56,11 @@ This is the default path. It is fast, transactional, and needs no extensions.
 ### Path 2 — JSON bulk insert
 
 ```sql
-INSERT INTO device(sync_id, payload, last_update, status, purge_on)
-SELECT json_extract(j.value, '$.sync_id'), json_extract(j.value, '$.payload'), …
+INSERT INTO device(key, payload, last_update, status, purge_on)
+SELECT json_extract(j.value, '$.key'), json_extract(j.value, '$.payload'), …
 FROM json_each(?1) AS j
 WHERE true
-ON CONFLICT(sync_id) DO UPDATE SET …;
+ON CONFLICT(key) DO UPDATE SET …;
 ```
 
 **One bound parameter carries the whole batch.** The parameter count becomes 1 regardless
@@ -85,7 +85,7 @@ the batch is large or the column count is high.
 CREATE TEMP TABLE _sync_stage (…same shape as the target…);
 -- bulk insert into the temp table, then:
 INSERT INTO device SELECT * FROM _sync_stage WHERE true
-ON CONFLICT(sync_id) DO UPDATE SET …;
+ON CONFLICT(key) DO UPDATE SET …;
 ```
 
 The most flexible — the staging table can be populated by whatever means is cheapest
@@ -110,7 +110,7 @@ not a correctness one.
 The upsert carries the last-write-wins filter directly:
 
 ```sql
-ON CONFLICT(sync_id) DO UPDATE SET
+ON CONFLICT(key) DO UPDATE SET
     payload     = excluded.payload,
     last_update = excluded.last_update,
     status      = excluded.status,

@@ -157,7 +157,29 @@ language can implement the same format.
 - The JSON path requires `FROM json_each(?1) AS j` and `WHERE true` before
   `ON CONFLICT` — asserted, so a refactor cannot silently break it.
 
-### 17. Site registry and allocation
+### 17. Peer authentication and the UUID directory
+
+- **A node outside the directory is refused**: an unknown UUID is rejected with
+  `UNKNOWN_PEER`, whatever credential it presents.
+- **A wrong-role credential is refused**: a master presenting the child string is
+  rejected with `BAD_CREDENTIAL`, and a child presenting the master string likewise.
+- **A child cannot be impersonated with a UUID it does not know**: the directory is never
+  sent to a child, and a child's handshake carries only its own entry.
+- **The directory merges across masters**: after a session between two masters, each holds
+  the union of both directories.
+- **Revocation is per node**: removing a UUID from the directory refuses that node
+  immediately, with no credential rotation and no effect on any other node.
+- **Mutual authentication works with one secret**: a child verifies a master's proof
+  against its own child string.
+- **The digest seed reaches children**: a child computes the same digest for the same
+  row as a master.
+- **No secret is written to the database**: after a full session, the digest seed, the
+  role strings and the credentials are nowhere in the file — verified by scanning the
+  database bytes, not by inspecting the API.
+- **A schema mismatch is fatal for a trusted peer and a warning for a client**: two
+  trusted peers differing only in registered column order are rejected at handshake.
+
+### 18. Site registry and allocation
 
 - **The range check**: an identifier inside the row's own site's range is accepted; one
   outside it is refused — on the plain `INSERT` path and on the `ON CONFLICT DO UPDATE`
@@ -221,10 +243,10 @@ Each phase of [../PLAN.md](../PLAN.md) is measured against these suites:
 | Phase | Must pass |
 |---|---|
 | 0 — Foundations | 14, and the allocator's "never reused" property |
-| 1 — Store and enforcement | 2, 3, 13, 17 |
+| 1 — Store and enforcement | 2, 3, 13, 18 |
 | 2 — Merkle tree | tree units, and the incremental-vs-rebuild property |
 | 3 — Diff engine | 1, 8, 9 |
-| 4 — Transport | 12, 15 |
+| 4 — Transport | 12, 15, 17 |
 | 5 — Lifecycle | 5, 6 |
 | 6 — Hardening | 4, 7, 10, 11, and the full suite |
 

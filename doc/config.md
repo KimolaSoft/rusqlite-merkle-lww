@@ -33,9 +33,14 @@ pub struct SyncConfig {
     pub purge_period:  Duration,      // 24h
 
     // ---- local identity ----
-    pub node_id:  Uuid,
+    pub node_id:  Uuid,               // issued by a master
     pub site:     String,
     pub role:     Role,               // Master | Child | Client
+
+    // ---- credentials ----
+    // The role string for this node's role. A master holds both; a child holds
+    // only the child string. Absent for a client.
+    pub credential: Option<SecretString>,
 
     // ---- local policy ----
     pub hot_window:    Duration,      // 24h
@@ -48,6 +53,24 @@ pub struct SyncConfig {
 }
 ```
 
+### Secrets
+
+Three values, and they are not interchangeable:
+
+| Value | Scope | Config field |
+|---|---|---|
+| master string | shared by all masters | supplied as `credential` on a master |
+| child string | shared by all children, known to all masters | supplied as `credential` on a child; held by a master for verification |
+| digest seed | shared by every node that computes digests — masters **and** children | `digest_seed` |
+
+**The crate persists none of them.** They are configuration, held in memory for the life
+of the process. The crate does not implement a secret store and does not implement
+rotation — both belong to the application.
+
+A master needs to *verify* both role strings, so a master's configuration carries the
+child string as well as its own; the `credential` field above is what the node
+*presents*, and the verification side is separate.
+
 ## Must agree across peers
 
 Some values cannot differ between peers, because a mismatch is a **correctness bug**
@@ -59,7 +82,37 @@ rather than a policy difference. These are checked at handshake and a mismatch i
 | `digest_seed` | The digest is keyed. A mismatch means every row hash differs | `DIGEST_SEED_MISMATCH` |
 | `retention` | Sets the purge horizon. Peers must agree on when a tombstone expires | rejected |
 | `purge_period` | Derives the global purge instants | rejected |
-| `schema_hash` | The shape of the synced data | rejected |
+| `codec_version` | The canonical encoding. A change re-digests every row | `CODEC_MISMATCH` |
+| `schema_hash` | Exactly the inputs to the row digest — see below | `SCHEMA_MISMATCH` |
+
+### What `schema_hash` covers
+
+This is the field that decides whether two nodes can converge at all, so it is defined
+exactly rather than loosely. It is a hash of **precisely the inputs to the row digest**:
+
+```
+schema_hash = seeded_xxh3(digest_seed,
+                  codec_version ‖
+                  for each table, in registration order:
+                    table name ‖
+                    key strategy ‖ key columns ‖
+                    ordered (column name, declared SQL type)
+                      of every replicated column ‖
+                    managed column names)
+```
+
+Two consequences:
+
+- **A peer whose column registration order differs is rejected.** The digest concatenates
+  values in registration order, so a different order is a different digest for the same
+  logical row — permanent, silent divergence. The registration order is part of the
+  schema, not an implementation detail.
+- **Local columns are excluded.** They are site-local by definition, and they are excluded
+  from the digest, so a peer legitimately has a different set of them.
+
+The `codec_version` is part of the hash because a change to the canonical encoding changes
+every digest. It is also surfaced separately, so the failure says "the encoding changed"
+rather than "the schema changed".
 
 These are also the values most likely to live in one shared place in the consumer's
 config — an environment variable, a mounted secret, a config-management system — which is
@@ -156,11 +209,21 @@ pub struct ColumnSpec {
     pub name:       String,
     pub replicated: bool,          // participates in sync and in the digest
     pub visibility: Visibility,    // Public | Restricted
+    pub local:      bool,          // meaningful only on the writing site
+    pub merge:      MergeMode,     // LastWriteWins | SetUnion
 }
 ```
 
 A column that is not `replicated` is local-only: it is not synced, not hashed, and not
 part of the digest.
+
+A column marked `local: true` **is** replicated, but is never overwritten by a remote
+write, and is **excluded from the digest** — otherwise two peers holding the same entity
+with different local values would compute different digests and never converge.
+
+**The registration order is load-bearing.** The digest concatenates the replicated values
+in registration order, so two nodes that register the same columns in a different order
+compute different digests for identical rows. The order is part of `schema_hash`.
 
 ### Managed column names
 
@@ -187,6 +250,22 @@ See [security.md](security.md).
 A child has exactly one upstream master, configured as `upstream: Option<Peer>`. A master
 may have several peers: other masters for the mesh, children it serves.
 
+### The directory is not config
+
+The peer list above is the **static** part — the endpoints this node knows about. The
+**UUID directory** is the dynamic part: every node's UUID, and who issued it.
+
+| | Peer list | UUID directory |
+|---|---|---|
+| Contents | endpoints and roles | UUIDs only |
+| Source | configuration | propagated master-to-master at handshake |
+| Stored | config | `_sync_directory` (node-local) |
+| Replicated | no | **no** |
+| Given to children | their master's entry only | **never** — it is the child security boundary |
+
+The two merge: a node is admissible if its UUID is in the directory **and** its endpoint
+is in the peer list.
+
 ## Where things live
 
 | Item | Location |
@@ -197,6 +276,8 @@ may have several peers: other masters for the mesh, children it serves.
 | TLS material | The consumer's, referenced by path or bytes |
 | `epoch_us`, `digest_seed` | Shared across the deployment; the consumer distributes them |
 | `retention`, `purge_period` | Shared across the deployment |
+| master / child string | The consumer's; **never written to the database** |
+| UUID directory | Node-local `_sync_directory`; merged from peers at handshake |
 
 The crate provides the **types** and the **defaults**. It does not provide a config file
 format that consumers are expected to adopt, because that is the one thing every consumer
@@ -206,30 +287,41 @@ already has an opinion about.
 
 ```toml
 # eu-west-1 — a master
-node_id  = "6f1e...-uuid"
+node_id  = "6f1e...-uuid"            # issued by a master
 site     = "eu-west"
 role     = "master"
 epoch_us = 1735689600000000          # same everywhere
 retention = "30d"
 purge_period = "24h"
 
+# The three secrets. The consumer's business, not ours — and never written
+# to the database by the crate.
 [digest_seed]
-source = "env:SYNC_DIGEST_SEED"      # the consumer's business, not ours
+source = "env:SYNC_DIGEST_SEED"
+
+[credentials.master]
+source = "env:SYNC_MASTER_STRING"    # presented by this node
+
+[credentials.verify]
+child = "env:SYNC_CHILD_STRING"     # used to verify a child's session
 
 [[peers]]
 node_id  = "a91b...-uuid"            # master B
 name     = "eu-west-2"
 role     = "master"
 endpoint = "https://eu-west-2.internal:8443"
-auth     = { token_env = "SYNC_TOKEN_EU_WEST_2" }
 
 [[peers]]
-node_id  = "c72d...-uuid"            # a child
+node_id  = "c72d...-uuid"            # a child, issued by this master
 name     = "eu-west-1-child-a"
 role     = "child"
 endpoint = "https://child-a.internal:8443"
-auth     = { token_env = "SYNC_TOKEN_CHILD_A" }
 ```
+
+Note what is *not* here: a per-peer token. A master's credential is the master string,
+a child's is the child string — the same string for every child, which is why the UUID
+directory is what distinguishes them. The `peers` table carries only endpoints and roles;
+membership comes from the directory, which is merged from other masters at handshake.
 
 ## Related documents
 

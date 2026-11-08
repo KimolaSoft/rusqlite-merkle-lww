@@ -67,21 +67,53 @@ both sides choose identical depths.
 ## Hash construction
 
 ```
-digest      = seeded_xxh3(key || last_update || status || purge_on || replicated_values)
-row_hash    = xxh3(key || last_update || status || purge_on || digest)
+digest      = seeded_xxh3(seed, digest_input)
+row_hash    = xxh3(key_enc || last_update_enc || status_enc || purge_on_enc || digest)
 
 hour_hash   = xxh3(hour_id_be  || row_count_be || Σ row_hash)
 cycle_hash  = xxh3(cycle_id_be || concat over 24 hours of (hour_id_be || hour_hash))
 month_hash  = xxh3(month_id_be || concat over 30 cycles of (cycle_id_be || cycle_hash))
 ```
 
-`key` is the sync key — the application's own column under `GlobalId`, or the crate-managed
-`sync_id` under the other strategies. `replicated_values` is every replicated column
-except those already named, in the registered order. That includes the `site` column on
-tables with allocated identifiers: it is replicated, so both peers must agree on it, and a
-disagreement must show up as a differing digest rather than as a silent divergence.
+`digest_input` is defined in [data-model.md](data-model.md) § "The digest input": the
+table name, the canonical key, the three managed columns, and then every remaining
+replicated, non-local column in the registered order. That last group includes the `site`
+column on tables with allocated identifiers — it is replicated, so both peers must agree
+on it, and a disagreement must show up as a differing digest rather than as a silent
+divergence.
 
 All integer fields are big-endian.
+
+### The digest is 16 bytes, big-endian, compared as u128
+
+The digest is a 128-bit value. It is serialised **big-endian**, and it is compared as an
+**unsigned 128-bit integer** — never as a byte slice in memory order.
+
+This matters in the tie-break. Two peers that compared the raw bytes in memory order
+would disagree on an exact-timestamp collision, and each would keep a different row — a
+permanent divergence, invisible until it caused one.
+
+```
+incoming.digest > local.digest   →   incoming_u128 > local_u128
+```
+
+### The ordering invariant
+
+Every node must compute the same digest for the same logical row, or it never
+synchronises. Three things must therefore be identical everywhere:
+
+| Must match | Governed by | Failure |
+|---|---|---|
+| Bucket assignment — a pure function of `last_update` and the shared epoch | `epoch_us` | `EPOCH_MISMATCH` |
+| The **registered column order** — the digest concatenates values in registration order | `schema_hash` | `SCHEMA_MISMATCH` |
+| The encoding rules themselves | `codec_version` | `CODEC_MISMATCH` |
+
+Two peers that register the same columns in different orders compute different digests
+for identical rows, and every bucket differs forever. This is the "sort identically" rule:
+the sort columns are the registered column order, and it is part of the schema hash.
+
+The digest covers replicated columns **except** those marked `local`, and the *order* of
+the remaining ones is load-bearing, not just their membership.
 
 ### Why the hour hash is a commutative sum
 

@@ -279,6 +279,11 @@ The key is encoded canonically (§ "Canonical encoding") into a BLOB, and that B
 primary key of `_sync_log`. Under `SiteNamespaced` the encoding includes the namespace, so
 `(eu-west, abc)` and `(tokyo, abc)` are distinct rows in the log.
 
+The rule is one rule: **the key encoding is the value encoding, applied to each key
+column in registered order.** `userid = 10001` encodes as a tagged INTEGER value, and the
+same bytes appear in `_sync_log.k`, in the digest input, and on the wire. There is no
+separate key format to keep in step.
+
 ## Column specifications
 
 ```rust
@@ -420,7 +425,12 @@ CREATE TABLE _sync_meta (
 ```
 
 Keys: `node_id`, `site`, `epoch_us`, `schema_version`, `last_purge_instant`,
-`retention_us`, `digest_seed`, `last_issued_us`.
+`retention_us`, `last_issued_us`.
+
+**No secret material is stored here.** The digest seed and the role strings are supplied
+by the application as configuration and held in memory for the life of the process. See
+[adr/0014-peer-credentials-and-the-uuid-directory.md](adr/0014-peer-credentials-and-the-uuid-directory.md)
+§ 5.
 
 ```sql
 CREATE TABLE _sync_log (
@@ -452,6 +462,26 @@ CREATE TABLE _sync_cursors (
 ```
 
 ```sql
+-- The UUID directory. Node-local control state, NOT replicated.
+-- Every master holds every node's UUID; a child holds only its own.
+CREATE TABLE _sync_directory (
+    node_id   TEXT PRIMARY KEY,
+    role      TEXT NOT NULL,       -- master | child
+    parent_id TEXT,                -- the issuing master; NULL for a master
+    added_us  INTEGER NOT NULL
+);
+```
+
+The directory is **control plane, not data plane**. It is not in `_sync_log`, not in the
+Merkle tree, and not in any application table. Masters merge it at handshake and take the
+union; children are never sent it.
+
+A child that learned another child's UUID could present `(that UUID, the child string)`
+and be accepted as that child — the child string is shared by all children, so the UUID is
+the only thing distinguishing them. The directory is therefore the child security
+boundary, and it is withheld from children for exactly that reason.
+
+```sql
 -- Compatible dialect only (§ sqlite-interface.md)
 CREATE TABLE _sync_staging (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -464,12 +494,18 @@ CREATE TABLE _sync_staging (
 ## The digest
 
 ```rust
-digest  = seeded_xxh3(seed,
-                      sync_id || last_update || status || purge_on
-                      || concat over replicated, non-local columns of value_enc)
-
-row_hash = xxh3(sync_id || last_update || status || purge_on || digest)
+digest   = seeded_xxh3(seed, digest_input)
+row_hash = xxh3(key_enc || value_enc(last_update) || value_enc(status)
+                || value_enc(purge_on) || digest)
 ```
+
+`digest_input` is defined in § "Canonical encoding". `row_hash` deliberately does **not**
+include the table name: it is a function of the digest, so a client that receives a
+digest it cannot recompute still computes the same `row_hash`. That is what lets a
+read-only client participate in tree diffing without ever holding a restricted value.
+
+The digest is **16 bytes**, big-endian on the wire, and compared as an unsigned 128-bit
+integer — never as a byte slice in memory order. See § "The digest is keyed".
 
 Four jobs, one value:
 
@@ -522,20 +558,64 @@ Determinism matters for hashing and for the wire format. Two peers must derive i
 bytes from identical logical rows.
 
 ```
-sync_id_enc := the sync key's bytes (the derived uuid, or the namespace
-               and key columns for SiteNamespaced)
-value_enc   := concat over replicated, non-local value columns of
-               tag(u8) || len(u32 LE) || bytes
-
-tag: 0 = NULL
-     1 = INTEGER (i64, little-endian)
-     2 = REAL    (f64, raw bit pattern)
-     3 = TEXT    (UTF-8)
-     4 = BLOB    (raw bytes)
+value_enc := tag(u8) || len(u32 LE) || bytes
+key_enc   := concat over the key columns, in registered order, of value_enc
 ```
+
+| `tag` | Type | Bytes |
+|---|---|---|
+| 0 | NULL | none |
+| 1 | INTEGER | `i64`, little-endian |
+| 2 | REAL | `f64`, raw bit pattern |
+| 3 | TEXT | UTF-8 |
+| 4 | BLOB | raw |
+
+`len` is `u32`, little-endian. The length is of the **payload**, not including the tag.
+
+**The key encoding is the value encoding, applied to each key column.** One rule, no
+special cases:
+
+| Strategy | `key_enc` |
+|---|---|
+| `GlobalId { key_columns: ["userid"] }` | `value_enc` of the `userid` column |
+| `Derived` | `value_enc` of the derived UUID, as a 16-byte BLOB |
+| `SiteNamespaced { site_column, key_columns }` | `value_enc` of the site column, then each key column |
+| `Surrogate` | `value_enc` of the surrogate, as a 16-byte BLOB |
+| `Rowid` | `value_enc` of the rowid as an INTEGER |
+
+So `userid = 10001` encodes as `01 08 00 00 00 11 27 00 00 00 00 00 00` — tag `1`,
+length `8`, then the `i64` little-endian. The same rule produces the bytes for
+`_sync_log.k`, for the digest input, and for the wire.
+
+Using the **runtime** type rather than the declared SQL type is deliberate: the tag
+distinguishes `INTEGER 1` from `TEXT "1"`, so two peers that disagree about a value's
+storage cannot accidentally agree on its digest. A peer whose *declared* types differ is
+caught earlier, by `schema_hash`.
 
 Column order is fixed by the registered spec, so both peers hash the same logical row to
 the same bytes.
+
+### The digest input
+
+The digest covers each of these exactly once, in this order:
+
+```
+digest_input := table_name_enc
+             || key_enc
+             || value_enc(last_update)
+             || value_enc(status)
+             || value_enc(purge_on)
+             || concat over the remaining replicated, non-local columns,
+                in registered order, of value_enc
+```
+
+"the remaining columns" is every replicated, non-local column **except** the three named
+above and the key columns. It includes the `site` column on tables with allocated
+identifiers, because it is replicated and both peers must agree on it.
+
+The **table name** is in the input, so a digest identifies a row *of a particular table*,
+not just a row. Two tables with identical columns and identical values do not produce
+the same digest.
 
 The type tags are load-bearing:
 

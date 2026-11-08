@@ -40,21 +40,34 @@ and silently** — nothing ever reports it.
 **The digest is always computed.** It is not an option.
 
 ```
-digest   = seeded_xxh3(seed, sync_id || last_update || status || purge_on
-                             || concat over replicated, non-local columns of value_enc)
-row_hash = xxh3(sync_id || last_update || status || purge_on || digest)
+digest   = seeded_xxh3(seed, digest_input)
+row_hash = xxh3(key_enc || last_update_enc || status_enc || purge_on_enc || digest)
 ```
+
+`digest_input` is defined in [../data-model.md](../data-model.md) § "The digest input":
+the table name, the canonical key, the three managed columns, and then every remaining
+replicated, non-local column in the registered order.
 
 **The digest is keyed** with a deployment secret (`seed`), using seeded xxh3.
 
-The secret is shared by all trusted peers and **absent from clients**.
+The secret is shared by every node that computes a digest — all trusted peers, **including
+children**, which write rows — and is **absent from clients**. It is a third value,
+separate from the two peer credential strings, and it is rotated independently of them;
+deriving it from a credential would couple a routine credential rotation to a full
+dataset rebuild. See [ADR-0014](0014-peer-credentials-and-the-uuid-directory.md).
+
+The digest is 16 bytes, big-endian on the wire, and compared as an unsigned 128-bit
+integer.
 
 ## Consequences
 
 **Positive**
 
-- **Tie-break works.** On an exact microsecond collision, the digest breaks the tie
-  deterministically. Both peers hold the same digest, so both reach the same conclusion.
+- **Tie-break works.** On an exact `last_update` collision, the digest breaks the tie
+  deterministically. This is a routine case, not a theoretical one: the clock underneath
+  may be coarser than our microsecond timestamps, and when two nodes write at the same
+  instant they have written *different data*. Both peers hold the same digest, so both
+  reach the same conclusion.
 - **Divergence is detectable.** `verify` reports rows whose stored digest disagrees with
   a recomputed one.
 - **No negotiation.** Because the digest is always computed, peers cannot disagree about

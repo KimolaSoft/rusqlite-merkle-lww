@@ -74,6 +74,43 @@ Both strategies are available per table. The choice is a data-modelling decision
 the default follows the expected deployment — see
 [ADR-0006](adr/0006-site-namespaced-keys.md).
 
+## Data placement
+
+The hierarchy controls **connectivity and write authority, not storage**.
+
+| Node | Holds |
+|---|---|
+| **master** | **all** application data, for the entire deployment |
+| **child** | all application data, except the UUID directory |
+| **client** | all application data that is neither `client_visible = false` nor `Restricted` |
+
+Every node's Merkle tree therefore covers the same row set, modulo the security
+exclusions, and every comparison is apples-to-apples.
+
+A child's data reaches other children by passing through its master — the master is the
+only node a child talks to — but the end state is identical everywhere. The UUID
+directory is a *routing* structure, not a replication boundary: a child never learns
+another child's UUID, and does not need to, because the data comes to it regardless.
+
+## The ordering invariant
+
+Every node must compute the same digest for the same logical row, or it never
+synchronises. Three things must therefore be identical everywhere:
+
+| Must match | Governed by | Failure |
+|---|---|---|
+| Bucket assignment — a pure function of `last_update` and the shared epoch | `epoch_us` | `EPOCH_MISMATCH` |
+| The **registered column order** — the digest concatenates values in registration order | `schema_hash` | `SCHEMA_MISMATCH` |
+| The encoding rules themselves | `codec_version` | `CODEC_MISMATCH` |
+
+Two peers that register the same columns in different orders compute different digests for
+identical rows, and every bucket differs forever. The registration order is part of the
+schema, not an implementation detail, and the schema hash covers it.
+
+This is the "sort identically" rule. There is no other sort: within a bucket, the hour
+hash is a commutative sum, so intra-bucket order does not matter — but the *digest input
+order* does, and that is what the schema hash pins.
+
 ## Transport
 
 **The crate does not implement TLS, and it does not dictate how the application exposes
