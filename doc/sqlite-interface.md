@@ -47,6 +47,13 @@ impl Db {
     /// Run a closure inside a transaction, on a pooled connection.
     pub fn transaction<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T>;
 
+    /// Install the crate's UDFs and authorizer on a connection the **caller owns**.
+    pub fn register_on(&self, conn: &rusqlite::Connection) -> Result<()>;
+
+    /// Run a closure with crate privilege on a registered caller-owned connection.
+    pub fn with_privilege<T>(&self, conn: &rusqlite::Connection,
+                             f: impl FnOnce() -> Result<T>) -> Result<T>;
+
     // Managed convenience layer — sugar over the above.
     pub fn upsert(&self, table: &str, key: &Key, values: &[(&str, Value)]) -> Result<()>;
     pub fn delete(&self, table: &str, key: &Key) -> Result<()>;
@@ -57,6 +64,38 @@ impl Db {
 The managed layer exists because it is convenient, and because `move_key` and soft
 delete need crate privilege. It is **not** required for correctness. An application that
 prefers `conn()` and raw SQL gets the same guarantees.
+
+### Registering on a connection the caller owns
+
+An application with an existing single-connection write path does not have to move every
+write into the crate's pool. `register_on` installs the same UDFs and the same
+authorizer on a connection the application opened:
+
+```rust
+let conn = rusqlite::Connection::open("app.sqlite")?;
+db.register_on(&conn)?;                 // once, at startup
+conn.execute("INSERT INTO users(…) VALUES (…)", params![…])?;
+```
+
+Two things make this work rather than merely appear to work:
+
+- **The UDFs close over the node's shared timestamp issuer.** The monotonic issuance
+  guard (§ "Monotonic issuance") is a per-node scalar, so a caller-owned connection must
+  issue timestamps from the *same* issuer as the pooled ones. `register_on` installs
+  closures over the shared `Arc<TimestampIssuer>`, and a timestamp issued on a
+  caller-owned connection is strictly greater than the last one issued anywhere in the
+  process.
+- **The privilege flag is per connection, as it always was.** `register_on` gives the
+  connection its own flag; the crate's own write path on that connection uses
+  `with_privilege`, which sets the flag for the duration of the closure.
+
+The caller is responsible for calling `register_on` on **every** connection it opens. A
+connection that is not registered fails closed in the enforced dialect — the write is
+refused with `no such function: sync_stamp` — which is the correct behaviour, but it is
+a refusal, not a silent downgrade.
+
+`rusqlite::Connection` is `Send` but not `Sync`, so a caller-owned connection used from
+several threads needs external locking, exactly as it would without the crate.
 
 ### The privilege flag
 
@@ -101,14 +140,18 @@ CREATE TABLE device (
 
 -- INSERT: nothing to stamp, the DEFAULT fires. Log the new row.
 CREATE TRIGGER sync_device_ai AFTER INSERT ON device BEGIN
-    INSERT INTO _sync_log(tbl, k, hlc_us, digest, deleted)
+    INSERT INTO _sync_log(tbl, k, last_update_us, purge_on_us, digest, deleted)
     VALUES ('device', NEW.sync_id,
             sync_us(NEW.last_update),
+            sync_us(NEW.purge_on),
             sync_digest(NEW.sync_id, NEW.last_update,
                         NEW.status, NEW.purge_on, NEW.payload),
             NEW.status = 'deleted')
     ON CONFLICT(tbl, k) DO UPDATE SET
-        hlc_us = excluded.hlc_us, digest = excluded.digest, deleted = excluded.deleted;
+        last_update_us = excluded.last_update_us,
+        purge_on_us    = excluded.purge_on_us,
+        digest         = excluded.digest,
+        deleted        = excluded.deleted;
 END;
 
 -- UPDATE: stamp only if the application did not supply a new last_update, then log.
@@ -121,9 +164,10 @@ BEGIN
 END;
 
 CREATE TRIGGER sync_device_au AFTER UPDATE ON device BEGIN
-    INSERT INTO _sync_log(tbl, k, hlc_us, digest, deleted)
+    INSERT INTO _sync_log(tbl, k, last_update_us, purge_on_us, digest, deleted)
     VALUES ('device', NEW.sync_id,
-            sync_us(NEW.last_update), sync_digest(...), NEW.status = 'deleted')
+            sync_us(NEW.last_update), sync_us(NEW.purge_on),
+            sync_digest(...), NEW.status = 'deleted')
     ON CONFLICT(tbl, k) DO UPDATE SET ...;
 END;
 
@@ -209,12 +253,13 @@ upsert is covered by the same rule.
 | Function | Signature | Returns |
 |---|---|---|
 | `sync_stamp()` | none | The node's next issued timestamp, as RFC 3339 text |
-| `sync_us(text)` | RFC 3339 text | The same instant as integer microseconds |
+| `sync_us(text)` | RFC 3339 text, or NULL | The same instant as integer microseconds; NULL in, NULL out |
 | `sync_digest(...)` | the row's key, timestamp, status, purge_on and replicated values | The 16-byte digest |
 | `local_site()` | none | The local node's `site_id` — only on tables with allocated identifiers |
 
 `sync_stamp()` is the monotonic-issuance mechanism (see below). `sync_us()` avoids
-parsing the timestamp back out of text inside SQLite. `sync_digest()` takes the row's
+parsing the timestamp back out of text inside SQLite, and returns NULL for a NULL input
+— which is what makes `purge_on_us` NULL for a live row. `sync_digest()` takes the row's
 values as arguments because it must hash exactly the replicated column set, in the
 registered order. `local_site()` is what populates the `site` column, so the application
 never writes it.

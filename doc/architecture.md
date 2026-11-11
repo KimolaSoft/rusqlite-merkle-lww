@@ -78,14 +78,20 @@ the default follows the expected deployment — see
 
 The hierarchy controls **connectivity and write authority, not storage**.
 
-| Node | Holds |
+│ Node | Holds |
 |---|---|
 | **master** | **all** application data, for the entire deployment |
 | **child** | all application data, except the UUID directory |
-| **client** | all application data that is neither `client_visible = false` nor `Restricted` |
+| **client** | the application data its **visibility profile** allows — never a restricted column, and never a table the profile excludes |
 
 Every node's Merkle tree therefore covers the same row set, modulo the security
 exclusions, and every comparison is apples-to-apples.
+
+The exclusion is decided by the **profile**, not by a per-node special case: a profile
+is a named projection mapped to a role and overridable per peer, so "masters exchange
+this column but children do not" and "this table is not for clients" are both
+declarations rather than code. See [data-model.md](data-model.md) § "Visibility
+profiles".
 
 A child's data reaches other children by passing through its master — the master is the
 only node a child talks to — but the end state is identical everywhere. The UUID
@@ -214,6 +220,13 @@ impl Db {
     /// Run a closure inside a transaction.
     pub fn transaction<T>(&self, f: impl FnOnce(&Transaction) -> Result<T>) -> Result<T>;
 
+    /// Install the crate's UDFs and authorizer on a connection the caller owns.
+    pub fn register_on(&self, conn: &rusqlite::Connection) -> Result<()>;
+
+    /// Run a closure with crate privilege on a registered caller-owned connection.
+    pub fn with_privilege<T>(&self, conn: &rusqlite::Connection,
+                             f: impl FnOnce() -> Result<T>) -> Result<T>;
+
     /// Managed convenience layer — sugar over the above.
     pub fn upsert(&self, table: &str, key: &Key, values: &[(&str, Value)]) -> Result<()>;
     pub fn delete(&self, table: &str, key: &Key) -> Result<()>;
@@ -223,7 +236,9 @@ impl Db {
 
 `Db::conn()` is the primary interface because the application keeps writing plain SQL —
 see [ADR-0002](adr/0002-enforce-in-sqlite-not-in-the-api.md) and
-[ADR-0010](adr/0010-no-orm-query-wrapper.md).
+[ADR-0010](adr/0010-no-orm-query-wrapper.md). `register_on` is the escape hatch for an
+application that cannot move its writes into the pool: it gets the same enforcement on
+the connection it already owns.
 
 ### `merkle-lww-axum`
 
@@ -252,6 +267,8 @@ rusqlite-merkle-lww/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── config.rs      # SyncConfig, TableSpec, Peer, CacheConfig
+│   │       ├── visibility.rs  # VisibilityProfile, projections, visibility_hash
+│   │       ├── merge.rs       # MergePolicy, MergePolicyFn, WriteAuthority
 │   │       ├── codec.rs       # canonical encoding, digest, seeded xxh3
 │   │       ├── time.rs        # RFC 3339, monotonic issuance
 │   │       ├── store.rs       # Db, pool, managed tables, DDL
@@ -316,7 +333,7 @@ This matters because rebuilding the snapshot touches every dirty bucket's ancest
 
     ROWS(differing buckets) ──────────────────────►  compare row digests,
                                                       exchange differing rows
-    ◄─────────────────────────────────────────────  rows
+    ◄─────────────────────────────────────────────  rows, in bounded pages
 
     COMMIT ───────────────────────────────────────►  advance cursor
     ◄─────────────────────────────────────────────  as_of, synced_us
@@ -324,6 +341,11 @@ This matters because rebuilding the snapshot touches every dirty bucket's ancest
 
 Both directions happen in the same session for bidirectional roles: the ROWS phase
 exchanges rows in both directions simultaneously, so there is no separate push API.
+
+The ROWS phase is **paged**: a message is bounded by `max_message_bytes`, and the
+session by `max_rounds_per_session`. Both bounds are resumable — a session that runs out
+of rounds is continued with the cursor it reached, not restarted. See
+[protocol.md](protocol.md) § "Paging and message budgets".
 
 Progress is reported throughout. See [protocol.md](protocol.md) § "Progress".
 
@@ -333,9 +355,10 @@ The design deliberately creates three, and each has a documented answer:
 
 | Failure | Answer |
 |---|---|
-| A peer is offline longer than the retention window | The staleness rule refuses incremental sync and requires a re-seed — [lifecycle.md](lifecycle.md) |
-| A purge happens while a peer is offline | The returning peer detects the newer purge instant at handshake and purges locally first — [lifecycle.md](lifecycle.md) |
+| A peer is offline longer than the retention window | The staleness rule refuses incremental sync; the peer re-seeds by **merging**, pushing its unsynced writes first and keeping its local rows — [lifecycle.md](lifecycle.md) |
+| A purge happens while a peer is offline | The returning peer detects the newer purge instant at handshake and purges locally first — a **catch-up purge**, not an error — [lifecycle.md](lifecycle.md) |
 | A row is edited without moving `last_update` | Detected by the stored digest; reported by `verify` — [data-model.md](data-model.md) § "Divergence detection" |
+| Two peers apply a custom merge policy to the same pair of rows and disagree | The policy was not convergent; the crate cannot detect this, so the policy must be pure — [data-model.md](data-model.md) § "Merge policies" |
 
 The first two are the only ones that can cause permanent divergence, and both are
 prevented by rules rather than by hope. The third is detected but not repaired — an

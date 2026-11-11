@@ -31,6 +31,7 @@ pub struct SyncConfig {
     pub digest_seed:   [u8; 32],
     pub retention:     Duration,      // 30d
     pub purge_period:  Duration,      // 24h
+    pub visibility_hash: VisibilityHash,  // derived from `profiles`
 
     // ---- local identity ----
     pub node_id:  Uuid,               // issued by a master
@@ -42,12 +43,20 @@ pub struct SyncConfig {
     // only the child string. Absent for a client.
     pub credential: Option<SecretString>,
 
+    // ---- visibility ----
+    // The named projections, and the role→profile mapping.
+    pub profiles:     Vec<VisibilityProfile>,
+    pub role_profile: HashMap<Role, String>,
+
     // ---- local policy ----
     pub hot_window:    Duration,      // 24h
     pub warm_window:   Duration,      // 90d
     pub purge_quiesce: Duration,      // 60s
-    pub max_skew:      Duration,      // 1s
+    pub max_skew:      Duration,      // 5s
+    pub max_message_bytes: usize,     // 4 MiB
+    pub max_rounds_per_session: u32,  // 1000
     pub write_mode:    WriteMode,     // Enforced | Compatible
+    pub audit:         bool,          // record attribution in _sync_audit
     pub cache:         CacheConfig,
     pub tables:        Vec<TableSpec>,
 }
@@ -84,6 +93,7 @@ rather than a policy difference. These are checked at handshake and a mismatch i
 | `purge_period` | Derives the global purge instants | rejected |
 | `codec_version` | The canonical encoding. A change re-digests every row | `CODEC_MISMATCH` |
 | `schema_hash` | Exactly the inputs to the row digest — see below | `SCHEMA_MISMATCH` |
+| `visibility_hash` | The visibility profile definitions — see below | `VISIBILITY_MISMATCH` |
 
 ### What `schema_hash` covers
 
@@ -118,6 +128,28 @@ These are also the values most likely to live in one shared place in the consume
 config — an environment variable, a mounted secret, a config-management system — which is
 exactly right.
 
+### What `visibility_hash` covers
+
+The **profile definitions**: for each profile, its name, whether it is trusted, and the
+per-table column lists.
+
+```
+visibility_hash = seeded_xxh3(digest_seed,
+                  for each profile, in registration order:
+                    profile name ‖ trusted flag ‖
+                    for each table, in registration order:
+                      table name ‖ visible flag ‖ ordered column names)
+```
+
+It is **separate from `schema_hash`** on purpose. `schema_hash` decides whether two
+nodes compute the same digest for the same logical row; `visibility_hash` decides
+whether they project that row the same way. Folding them together would force a
+read-only client — whose registration is necessarily narrower — to fail the digest
+check.
+
+A **client** session compares neither. The client names its profile, the server
+resolves it to a projection and sends it, and the client applies it.
+
 `epoch_us` deserves a note: it is an arbitrary instant, and its only job is to make
 bucket boundaries agree. Any fixed value works. Midnight UTC on some epoch is a
 conventional choice because it makes the boundaries line up with the calendar, but it is
@@ -132,9 +164,12 @@ Everything else is local policy.
 |---|---|---|
 | `hot_window` | 24 h | Ranges newer than this compare at hour depth |
 | `warm_window` | 90 d | Ranges newer than this compare at cycle depth; older compare at month depth |
-| `purge_quiesce` | 60 s | The window around each purge instant during which sync is refused |
-| `max_skew` | 1 s | Refuse peers believed to be more than this far out of clock |
+| `purge_quiesce` | 60 s | The window around each purge instant during which the tables being purged refuse sync |
+| `max_skew` | 5 s | Refuse peers believed to be more than this far out of clock |
+| `max_message_bytes` | 4 MiB | The soft budget one protocol message may occupy |
+| `max_rounds_per_session` | 1000 | Round trips before a session ends with a retryable `SESSION_LIMIT` |
 | `write_mode` | `Enforced` | Which trigger dialect is in use |
+| `audit` | `false` | Record which peer applied which row, in `_sync_audit` |
 | `cache` | see below | Read-through cache limits |
 
 `hot_window` and `warm_window` are local because they only affect **comparison depth**,
@@ -142,7 +177,19 @@ which is a performance choice. The bucket boundaries are absolute regardless.
 
 `purge_quiesce` being local is safe: the quiesce window is a local refusal to serve
 sync, not a shared instant. The *purge instant* is shared (it derives from `epoch_us` and
-`purge_period`); the window around it need not be.
+`purge_period`); the window around it need not be. The window is **per table** — a node
+with no tombstones due does not quiesce at all.
+
+`max_skew` is 5 s because 1 s is tighter than the clock discipline a set of
+geographically distributed sites can actually guarantee. Cross-site NTP agreement is
+usually within a second or two; refusing peers at a one-second threshold rejects
+sessions that would have been perfectly ordered. 5 s is still far below the granularity
+that matters for LWW here, and it is a **local** threshold: two nodes may disagree about
+it without breaking anything.
+
+`max_message_bytes` and `max_rounds_per_session` are local too. They bound what this
+node is willing to send or receive in one message or one session; the peer answers with
+its own budget, and the effective limit is the smaller of the two.
 
 ## Cache configuration
 
@@ -175,7 +222,10 @@ pub struct TableSpec {
     pub kind:          TableKind,          // Keyed | AppendOnly
     pub key:           KeyStrategy,
     pub columns:       Vec<ColumnSpec>,
-    pub client_visible: bool,
+    pub merge:         MergePolicy,        // LastWriteWins | Custom(..)
+    pub write_authority: WriteAuthority,   // Any | MasterOnly | OwnerOnly | Roles(..)
+    pub sync_priority: u8,                 // lower syncs first
+    pub allocation:    Option<AllocationSpec>,
 }
 
 pub enum TableKind {
@@ -193,9 +243,23 @@ there is nothing to delete, and it removes the soft-delete machinery from the tr
 
 ```rust
 pub enum KeyStrategy {
-    SiteNamespaced { site_column: String, key_columns: Vec<String> },
+    /// The application's own column, already globally unique and stable.
+    /// The default.
     GlobalId { key_columns: Vec<String> },
+
+    /// A deterministic id derived by the crate from identity columns.
+    Derived {
+        identity_columns: Vec<String>,
+        prefix: Option<String>,
+    },
+
+    /// Owner-namespaced: the row's site is part of the key.
+    SiteNamespaced { site_column: String, key_columns: Vec<String> },
+
+    /// A random surrogate. Never merges across sites.
     Surrogate { column: String },
+
+    /// SQLite's implicit rowid.
     Rowid,
 }
 ```
@@ -225,6 +289,47 @@ with different local values would compute different digests and never converge.
 in registration order, so two nodes that register the same columns in a different order
 compute different digests for identical rows. The order is part of `schema_hash`.
 
+### Visibility profiles
+
+```rust
+pub struct VisibilityProfile {
+    pub name:    String,
+    pub trusted: bool,              // may see `Restricted` columns
+    pub tables:  Vec<ProfileTable>,
+}
+
+pub struct ProfileTable {
+    pub table:   String,
+    pub visible: bool,              // the table is excluded entirely when false
+    pub columns: Vec<String>,       // the columns this profile may see
+}
+```
+
+Profiles are mapped to roles by `role_profile`, and a specific peer may override the
+mapping with its own `profile` field. A `Public` column is visible to every profile; a
+`Restricted` column only to `trusted` ones.
+
+### Merge policies and write authority
+
+```rust
+pub enum MergePolicy {
+    LastWriteWins,                  // the default
+    Custom(Arc<dyn MergePolicyFn>),
+}
+
+pub enum WriteAuthority {
+    Any,                            // the default
+    MasterOnly,
+    OwnerOnly,
+    Roles(Vec<Role>),
+}
+```
+
+A custom merge policy must be **pure and convergent** — the same pair of rows must
+produce the same decision on every peer. See
+[data-model.md](data-model.md) § "Merge policies" for the rules, and
+[adr/0015](adr/0015-per-table-merge-policies-and-write-authority.md) for the reasoning.
+
 ### Managed column names
 
 The four crate-owned columns can be renamed per table, for tables whose existing schema
@@ -242,8 +347,15 @@ pub struct Peer {
     pub role:      Role,
     pub endpoint:  String,
     pub auth:      PeerAuth,
+
+    /// Overrides the role→profile mapping for this peer. `None` uses the mapping.
+    pub profile:   Option<String>,
 }
 ```
+
+A peer may override the visibility profile the role mapping would give it — a
+read-only TUI client that must not see a payload column gets its own profile, while
+every other client keeps the default one.
 
 See [security.md](security.md).
 
@@ -276,8 +388,12 @@ is in the peer list.
 | TLS material | The consumer's, referenced by path or bytes |
 | `epoch_us`, `digest_seed` | Shared across the deployment; the consumer distributes them |
 | `retention`, `purge_period` | Shared across the deployment |
+| `profiles` | Shared across the deployment — a divergence is `VISIBILITY_MISMATCH` |
 | master / child string | The consumer's; **never written to the database** |
+| per-node secret | The consumer's; **never written to the database** |
 | UUID directory | Node-local `_sync_directory`; merged from peers at handshake |
+| session journal | Node-local `_sync_session`; a client's own resume state |
+| attribution audit | Node-local `_sync_audit`; off by default, never replicated |
 
 The crate provides the **types** and the **defaults**. It does not provide a config file
 format that consumers are expected to adopt, because that is the one thing every consumer

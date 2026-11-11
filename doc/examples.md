@@ -453,6 +453,12 @@ that:
 The registry must be in the **main database** — triggers cannot reference an attached
 database — and the range it records is **immutable**.
 
+This whole mechanism is **optional**. An application that already has an identifier
+scheme — a central id service, a per-team leased range of its own — declares no
+`AllocationSpec` and gets none of it: no registry, no `site` column, no range trigger,
+and no REGISTRY phase. See
+[adr/0019](adr/0019-the-allocation-registry-is-optional.md).
+
 ### 3. Local columns are never overwritten by a remote write
 
 Some columns are meaningful only within the site that wrote them — a local counter, a
@@ -526,4 +532,5 @@ Everything above was checked against rusqlite 0.41.1 with bundled SQLite 3.54.1.
 - [bulk-apply.md](bulk-apply.md) — applying many rows at once
 - [sqlite-interface.md](sqlite-interface.md) — the trigger set
 - [adr/0013-site-registry-and-range-allocation.md](adr/0013-site-registry-and-range-allocation.md) — the registry decision
+- [adr/0019-the-allocation-registry-is-optional.md](adr/0019-the-allocation-registry-is-optional.md) — the registry is optional
 - [../PLAN.md](../PLAN.md) — where the allocator and column-locality work lands

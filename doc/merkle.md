@@ -182,11 +182,13 @@ limit.
 
 ### At startup
 
-One indexed pass over `_sync_log` ordered by `(tbl, hlc_us)`. For each row, fold its row
-hash into its hour bucket, then recompute the affected cycle and month hashes.
+One indexed pass over `_sync_log` ordered by `(tbl, last_update_us)`. For each row, fold
+its row hash into its hour bucket, then recompute the affected cycle and month hashes.
 
 O(rows), no payload reads. The digest is stored in `_sync_log`, so the payload columns
-are never touched.
+are never touched. The timestamp is stored in the log as an integer for exactly this
+reason — see [data-model.md](data-model.md) § "Why the log carries its own
+timestamp".
 
 ### On write
 

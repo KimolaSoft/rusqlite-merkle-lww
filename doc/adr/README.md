@@ -25,8 +25,14 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | [0010](0010-no-orm-query-wrapper.md) | No ORM; the crate owns the connection, not the query language | accepted |
 | [0011](0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport | accepted |
 | [0012](0012-sync-key-is-the-applications-key.md) | The sync key is the application's key when it is globally unique and stable | accepted |
-| [0013](0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier | accepted |
-| [0014](0014-peer-credentials-and-the-uuid-directory.md) | Role-level credentials, a master-issued UUID directory, and a separate digest seed | accepted |
+| [0013](0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier | superseded by 0019 |
+| [0014](0014-peer-credentials-and-the-uuid-directory.md) | Role-level credentials, a master-issued UUID directory, and a separate digest seed | superseded by 0020 |
+| [0015](0015-per-table-merge-policies-and-write-authority.md) | Per-table merge policies, and write authority evaluated against the row's origin | accepted |
+| [0016](0016-visibility-profiles-mapped-to-peer-roles.md) | Visibility profiles mapped to peer roles, hashed separately from the schema | accepted |
+| [0017](0017-re-seed-is-a-merge-not-a-wipe.md) | A re-seed merges; it never discards a peer's unsynced local writes | accepted |
+| [0018](0018-bounded-messages-paged-transfer-and-durable-client-sessions.md) | Bounded messages, paged transfer, and durable client sessions | accepted |
+| [0019](0019-the-allocation-registry-is-optional.md) | The site registry and the allocator are optional | accepted |
+| [0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | The application's authenticated identity binds to the claimed node id; per-node credentials and attribution are optional | accepted |
 
 ## Status values
 

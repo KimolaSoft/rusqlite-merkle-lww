@@ -90,7 +90,9 @@ let spec = TableSpec {
         ColumnSpec { name: "secret".into(),  replicated: true, visibility: Visibility::Restricted,
                      local: false, merge: MergeMode::LastWriteWins },
     ],
-    client_visible: true,
+    merge: MergePolicy::LastWriteWins,
+    write_authority: WriteAuthority::Any,
+    sync_priority: 0,
     allocation: Some(AllocationSpec {
         id_column:      "userid".into(),
         site_column:    "site".into(),
@@ -132,6 +134,13 @@ CREATE TABLE sites (
 It must be in the **same database** as your data — SQLite forbids a trigger from
 referencing an object in an attached database, and the range check is a trigger.
 
+**You do not have to use any of this.** If your application already has an identifier
+scheme — a central id service, a per-team leased range of its own — leave
+`allocation: None` and the crate adds no registry, no `site` column, no range trigger
+and no REGISTRY phase. The allocation machinery is an optional feature of the crate,
+not a precondition for syncing. See
+[adr/0019](adr/0019-the-allocation-registry-is-optional.md).
+
 **Your table needs a `site` column**, naming the site that owns the identifier. The crate
 fills it; you never write it:
 
@@ -165,6 +174,38 @@ overwrites it, and it is excluded from the digest so that peers can still conver
 
 For a table whose rows are genuinely per-site, use `KeyStrategy::SiteNamespaced` instead.
 
+### 2a. Describe your visibility profiles
+
+A profile is a named projection of the schema — which tables a class of peer sees, and
+which columns of them:
+
+```rust
+let profiles = vec![
+    VisibilityProfile { name: "master".into(), trusted: true,
+                       tables: all_tables_with_all_columns() },
+    VisibilityProfile { name: "child".into(), trusted: true,
+                       tables: all_tables_except("credentials") },
+    VisibilityProfile { name: "client".into(), trusted: false,
+                       tables: public_tables_without("readings") },
+];
+```
+
+The rules are short:
+
+- A `Public` column is visible to every profile. A `Restricted` column is visible only
+  to `trusted` profiles.
+- A table with `visible: false` is absent from that class of peer entirely — its
+  existence and its shape are not advertised.
+- A specific peer may override its role's profile (`Peer.profile`), which is how one
+  read-only client gets a narrower view than the others.
+- A peer may write a table only if its profile exposes **every** replicated column of
+  it: a peer that cannot see a column cannot compute the row's digest.
+
+The profiles must be identical across the deployment — a divergence is
+`VISIBILITY_MISMATCH` at handshake, fatal between trusted peers.
+
+See [data-model.md](data-model.md) § "Visibility profiles".
+
 ### 3. Open the store
 
 ```rust
@@ -192,6 +233,31 @@ means:
 - **If you use `diesel`, `sqlx`, or the `sqlite3` CLI**, the enforced dialect cannot work,
   because those open their own connections. Use the compatible dialect, or keep those
   tools away from the managed tables.
+
+### 4a. Or keep your own connection
+
+If your application already has a single-connection write path, you do not have to move
+every write into the crate's pool. Register the crate on the connection you own:
+
+```rust
+let conn = rusqlite::Connection::open("app.sqlite")?;
+db.register_on(&conn)?;              // once, at startup
+```
+
+`register_on` installs the same UDFs and the same authorizer, and the UDFs issue
+timestamps from the **same shared monotonic issuer** the pooled connections use — so the
+guarantee that a node's timestamps never go backwards holds across both.
+
+Call it on **every** connection you open. An unregistered connection fails closed in the
+enforced dialect: the write is refused, loudly, rather than silently corrupting the
+sync state.
+
+The crate's own writes on that connection — the soft delete, the purge, the key move —
+need crate privilege, which is scoped to the connection:
+
+```rust
+db.with_privilege(&conn, || db.delete("users", &key))?;
+```
 
 ### 5. Expose the exchange
 
@@ -305,6 +371,38 @@ local sequence collides with a different local row will fail to insert.
 
 ### Do not expect a JSON array column to merge as a set
 
+The real answer is to normalise the set into its own table — one row per member, each
+with its own LWW and its own deletion. The JSON-array discussion is below.
+
+### Use a merge policy only when LWW is not enough
+
+The default merge is last-write-wins on the whole row, and it is the default because it
+is a **total order**: given two versions of a row, every peer reaches the same
+conclusion. That property is what convergence rests on.
+
+If a table needs something else — first-allocation-wins on a lease, an epoch-ordered
+ownership field, a batch repair before apply — express it as a per-table merge policy:
+
+```rust
+impl MergePolicyFn for LeasePolicy {
+    fn merge(&self, ctx: &MergeContext<'_>, incoming: &IncomingRow,
+             local: Option<&StoredRow>) -> MergeDecision {
+        // …your rule…
+    }
+}
+```
+
+Two rules, both requirements:
+
+- **Be pure.** The same pair of rows must produce the same decision on every peer. Do
+  not read the wall clock, a local counter, or anything else that differs between nodes.
+- **Repair on the sender.** If a batch needs fixing up before it can be applied — to
+  satisfy a partial unique index, say — do it in `prepare`, which runs before the rows
+  are replicated. A repair applied on receipt changes the stored bytes and therefore the
+  digest, and the two peers would never converge.
+
+See [data-model.md](data-model.md) § "Merge policies".
+
 ### Do not write to `_sync_*`
 
 These are internal. The authorizer rejects writes on instrumented connections, and the
@@ -347,8 +445,8 @@ because the removed element comes back on the next union.
 
 ### Keep clocks synchronised
 
-NTP or chrony, agreeing within ±1 second. This is a hard requirement, not a
-recommendation — see [operations.md](operations.md).
+NTP or chrony, agreeing within `max_skew` — 5 seconds by default. This is a hard
+requirement, not a recommendation — see [operations.md](operations.md).
 
 ### Do not change `epoch_us` after data exists
 
@@ -415,11 +513,14 @@ overlap".
 ## Checklist before going live
 
 - [ ] All nodes share the same `epoch_us` and `digest_seed`.
-- [ ] All nodes are within ±1 second of each other.
+- [ ] All nodes share the same visibility profiles (`visibility_hash` agrees).
+- [ ] All nodes are within `max_skew` of each other — 5 seconds by default.
 - [ ] `retention` and `purge_period` match across peers.
-- [ ] The application uses `Db::conn()` (or the connection factory) for managed tables.
+- [ ] The application uses `Db::conn()`, the connection factory, or `register_on` for
+      managed tables.
 - [ ] TLS is terminated somewhere.
 - [ ] Peers are in the configured peer list.
+- [ ] The application's authenticated identity is passed to the session, if it has one.
 - [ ] A `verify` run reports no digest divergence.
 - [ ] A test restore of one node completes and re-converges.
 - [ ] The purge quiesce window does not overlap a deployment.

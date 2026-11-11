@@ -1,6 +1,6 @@
 # ADR-0014: Role-level credentials, a master-issued UUID directory, and a separate digest seed
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md)
 - **Date:** 2026-11
 - **Deciders:** project maintainers
 
@@ -241,3 +241,6 @@ to children — the one place it must not reach.
 - [../config.md](../config.md) — where the values live
 - [../architecture.md](../architecture.md) — roles, topology, data placement
 - [../protocol.md](../protocol.md) — the handshake
+- [ADR-0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md)
+  — binds the application's authenticated identity to the claimed node id, and makes
+  per-node credentials and local attribution available

@@ -122,6 +122,12 @@ The `WHERE` clause on `DO UPDATE` means an older incoming row is silently droppe
 than overwriting a newer one. This is the primary defence against a peer sending stale
 data, and it is enforced by the database rather than by the calling code.
 
+**This filter is the default merge policy, and only the default merge policy.** A table
+with a custom merge policy ([data-model.md](data-model.md) § "Merge policies") decides
+in Rust — the policy may take the incoming row, keep the local one, or synthesise a
+merged row — and only the rows it accepts are upserted. The `WHERE` clause would
+override that decision, so it is not used for those tables.
+
 Verified behaviour:
 
 - An older write arriving after a newer one → the newer value is kept.
@@ -179,10 +185,14 @@ the log is what makes the next sync cheap, and what makes a re-seed possible.
 
 ## Row counts and the protocol
 
-The wire protocol's ROWS phase (§ [protocol.md](protocol.md)) already sends rows grouped
-by bucket. The receiver's batch size is bounded by the bucket's row count, and a busy
-hour could be large. So the receiving side applies a bucket's rows in chunks, and reports
-progress as it goes — which is what the `Transferring` phase's denominator counts.
+The wire protocol's ROWS phase (§ [protocol.md](protocol.md)) sends rows grouped by
+bucket. The receiving side applies a bucket's rows in chunks, and reports progress as it
+goes — which is what the `Transferring` phase's denominator counts.
+
+A **page** is the unit that arrives: the sender stops at `max_message_bytes` and
+returns a cursor, so the batch the receiver applies is bounded by the byte budget and
+not by the size of the bucket. A busy hour is therefore several pages, not one
+enormous one — see [protocol.md](protocol.md) § "Paging and message budgets".
 
 ## Verified behaviour
 

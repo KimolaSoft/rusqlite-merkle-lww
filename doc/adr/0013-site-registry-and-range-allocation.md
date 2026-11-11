@@ -1,6 +1,6 @@
 # ADR-0013: A site registry in the main database; a row names the site that owns its identifier
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0019](0019-the-allocation-registry-is-optional.md)
 - **Date:** 2026-11
 - **Deciders:** project maintainers
 
@@ -282,3 +282,5 @@ identifiers never collide — is met by central allocation plus local enforcemen
 - [../sqlite-interface.md](../sqlite-interface.md) — the trigger set
 - [../lifecycle.md](../lifecycle.md) — decommissioning a site, and retired ranges
 - [ADR-0012](0012-sync-key-is-the-applications-key.md) — the sync key decision
+- [ADR-0019](0019-the-allocation-registry-is-optional.md) — makes the registry optional;
+  the decisions above still hold wherever the registry is in use

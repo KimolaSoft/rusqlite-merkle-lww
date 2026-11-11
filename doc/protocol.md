@@ -24,11 +24,13 @@ differing rows and receives the peer's — so there is no separate push API.
   "node_id": "…",              // 128-bit hex
   "site": "eu-west",
   "role": "master",            // master | child | client
+  "profile": "master",         // the visibility profile this session runs under
   "epoch_us": 1735689600000000,
   "as_of_us": 1792953600000000,
   "last_purge_instant": 1792617600000000,
   "retention_us": 2592000000000,
   "last_sync_us": 1792950000000000,
+  "registry": { "enabled": true },   // false when the deployment brings its own ids
   "tables": [ { "name": "device",
                 "kind": "keyed",
                 "key": { "strategy": "global_id",
@@ -37,7 +39,7 @@ differing rows and receives the peer's — so there is no separate push API.
                                "visibility": "public" },
                              { "name": "secret", "replicated": true,
                                "visibility": "restricted" } ],
-                "client_visible": true },
+                "write_authority": "any" },
               { "name": "sites",
                 "kind": "keyed",
                 "key": { "strategy": "global_id",
@@ -46,8 +48,9 @@ differing rows and receives the peer's — so there is no separate push API.
                                "visibility": "public" },
                              { "name": "uid_end", "replicated": true,
                                "visibility": "public" } ],
-                "client_visible": true } ],
+                "write_authority": "master_only" } ],
   "schema_hash": "…",
+  "visibility_hash": "…",
   "codec_version": 1,
   "directory": [ { "node_id": "…", "role": "master" },
                  { "node_id": "…", "role": "child",
@@ -55,9 +58,26 @@ differing rows and receives the peer's — so there is no separate push API.
 }
 ```
 
-The `sites` registry is listed like any other table, but it is **not optional**: it is
-exchanged first in every session, and a node that has never synced receives it as part of
-the join bundle rather than by syncing. See § "REGISTRY".
+The `sites` registry is listed like any other table, but it is **conditional**: it is
+exchanged first in every session **when the deployment uses the crate's allocator**,
+and a node that has never synced receives it as part of the join bundle rather than by
+syncing. When `registry.enabled` is false there is no registry, no `site` column, and
+no REGISTRY phase. See § "REGISTRY".
+
+### The projection
+
+A session runs under exactly one **visibility profile** — a named set of tables and
+columns ([data-model.md](data-model.md) § "Visibility profiles"). The profile is
+resolved during the handshake, and the resolved **projection** is sent to the peer:
+
+```jsonc
+"projection": [ { "table": "device", "columns": ["payload"] } ]
+```
+
+For a trusted peer the projection is the whole registered schema and the two sides
+compare `visibility_hash`. For a client session the server sends the projection for the
+client's profile and the client applies it — a client never sees a column outside its
+profile, and it never sees a table the profile excludes.
 
 ### The directory in the handshake
 
@@ -82,40 +102,75 @@ A client sends no directory and receives none.
 | `codec_version` differs | `CODEC_MISMATCH` — fatal; the encoding changed, so every digest changed |
 | `digest_seed` differs (trusted peers) | `DIGEST_SEED_MISMATCH` — fatal; every row hash differs |
 | `schema_hash` differs (trusted peers) | `SCHEMA_MISMATCH` — fatal; the digest inputs differ |
+| `visibility_hash` differs (trusted peers) | `VISIBILITY_MISMATCH` — fatal; the profiles differ, so the peers project the data differently |
 | `node_id` not in the directory | `UNKNOWN_PEER` |
+| `node_id` differs from the application's authenticated identity | `IDENTITY_MISMATCH` — fatal; the peer is not who the transport says it is |
 | credential does not verify for the claimed role | `BAD_CREDENTIAL` |
 | `as_of_us` differs by more than the tolerance | the server's wins; the client adopts it |
-| `last_purge_instant` — peer is older than ours | `STALE_PEER` (see [lifecycle.md](lifecycle.md)) |
-| peer requests a `Restricted` column | `COLUMN_NOT_PERMITTED` |
+| `last_sync_us` — peer is older than the staleness horizon | `STALE_PEER` — the peer must re-seed (see [lifecycle.md](lifecycle.md)) |
+| `last_purge_instant` — peer is newer than ours | **not a failure**: the local node catches up by purging locally, then syncs |
+| `last_purge_instant` — peer is older than ours | **not a failure**: the peer catches up on its side; the local node says so in the handshake |
+| peer requests a column outside its profile | `COLUMN_NOT_PERMITTED` |
 | unknown `tables`/`columns`, **client** session | sync the intersection, log a warning |
 | unknown `tables`/`columns`, **trusted peer** | `SCHEMA_MISMATCH` — fatal |
 
 The last two rows are not in conflict, and the distinction matters. A read-only client
-legitimately sees a narrower schema — only the public projection — so the intersection is
-the right behaviour. A **trusted peer** that disagrees about the replicated column set
-would compute different digests for the same logical row, and the trees would never
-converge. That is not a warning; it is fatal. The `schema_hash` is what makes the
-difference detectable.
+legitimately sees a narrower schema — only the profile's projection — so the
+intersection is the right behaviour. A **trusted peer** that disagrees about the
+replicated column set would compute different digests for the same logical row, and the
+trees would never converge. That is not a warning; it is fatal. The `schema_hash` is
+what makes the difference detectable.
 
 `as_of_us` is the single timestamp driving the comparison-depth policy and the "what
 changed since" computation. In a client→server session the server supplies it, so both
 sides choose identical depths.
 
+### Two different failure modes, two different meanings
+
+**Missing a purge is not staleness.** A peer whose `last_purge_instant` is behind ours
+has missed one or more purge instants; it catches up by purging locally, and the
+session proceeds. This is a routine, recoverable condition.
+
+**Being offline beyond the retention window is staleness.** A peer whose
+`last_sync_us` is older than `now - retention` may still hold a live row whose
+tombstone has been purged, and nothing can order those two rows. It must re-seed. The
+check is mesh-wide, not per-link — see [lifecycle.md](lifecycle.md) § "The staleness
+rule".
+
+### The authenticated identity
+
+The application authenticates the peer — with TLS, mTLS, a JWT, whatever it already
+uses — and tells the crate who it is:
+
+```rust
+SessionContext {
+    authenticated_peer:   Some(node_id),   // the identity the transport established
+    authenticated_subject: Some("spiffe://…"),
+}
+```
+
+When `authenticated_peer` is set, the `node_id` in the HELLO **must** equal it, or the
+session is refused with `IDENTITY_MISMATCH`. This closes the gap that role-level
+credentials leave open: without it, any master could claim any other master's UUID.
+The crate does not authenticate anybody — it binds the identity the application already
+established to the node id the peer claims. See
+[security.md](security.md) § "The authenticated identity".
+
 ## Session phases
 
 ```
 1. HELLO     client → server
-2. REGISTRY  exchange the site registry
+2. REGISTRY  exchange the site registry        (only when the allocator is in use)
 3. SUMMARY   exchange bucket hashes for a range
 4. DETAIL    exchange child hashes for the buckets that differ
-5. ROWS      exchange the differing rows
+5. ROWS      exchange the differing rows, in pages
 6. COMMIT    advance the cursor
 ```
 
 ### REGISTRY
 
 The site registry is exchanged **before** any data, and applied before any data is
-accepted.
+accepted — **when the deployment uses the crate's allocator**.
 
 The reason is the range check. A node cannot validate an identifier it has no range for,
 so the registry must be current before a row arrives. It is also the reason the registry is
@@ -127,6 +182,12 @@ The phase is a normal table sync — the same SUMMARY/DETAIL/ROWS machinery, ove
 when the registry itself has not changed. A session that omits it would accept rows whose
 owners it does not know, which the range trigger defers rather than rejects.
 
+**The phase is conditional.** A deployment that brings its own identifier scheme sets
+`registry.enabled = false` in the handshake; there is then no registry table, no `site`
+column, no range check, and no REGISTRY phase. The allocation machinery is an optional
+feature of the crate, not a precondition for syncing. See
+[adr/0019](adr/0019-the-allocation-registry-is-optional.md).
+
 For a site created *during* a session, the registry row may reach the peer after the
 site's data rows do. The range trigger fires only when the registry knows the row's
 owner, so such a row is accepted provisionally and re-validated when the registry catches
@@ -137,16 +198,26 @@ up.
 ```jsonc
 // request
 { "session_id": "…", "tbl": "device",
-  "from_us": …, "to_us": …, "level": "hour|cycle|month" }
+  "from_us": …, "to_us": …, "level": "hour|cycle|month",
+  "hashes": [ { "bucket_id": 29681, "level": "hour",
+                "hash": "…", "count": 42 } ] }
 
 // response
 { "session_id": "…",
+  "hashes": [ { "bucket_id": 29681, "level": "hour",
+                "hash": "…", "count": 42 } ],
   "differing": [ { "bucket_id": 29681, "level": "hour" } ],
   "total_buckets": 8766 }
 ```
 
-Each side sends the hashes it holds for the range; each computes the symmetric
-difference. The differing set is symmetric, so both sides learn the same set.
+Each side sends **the hashes it holds for the range**, and each computes the symmetric
+difference from the two hash lists. The differing set is symmetric, so both sides learn
+the same set; the `differing` list in the response is the responder's own computation,
+carried as a cross-check.
+
+A hash list is ordered by `(level, bucket_id)`, so the two sides can be compared without
+a sort at the receiver, and a truncated list (see § "Paging and message budgets") is
+always a prefix of the full one.
 
 `total_buckets` is the number of buckets in the range at the requested depth, exactly
 computable from the time range and the depth. It is the progress denominator for the
@@ -182,6 +253,50 @@ Both modes are idempotent and safe to retry.
 
 Deleted rows are transmitted with their full payload and their `status`/`purge_on`, in
 the same bucket as everything else — no separate tombstone stream, no extra round trip.
+
+Every ROWS batch carries the **origin** of the rows it contains:
+
+```jsonc
+{ "session_id": "…", "tbl": "device", "mode": "digest",
+  "origin": { "node_id": "…", "role": "child", "site": "eu-west" },
+  "cursor": { "bucket_id": 29681, "level": "hour", "last_key": "…" },
+  "rows": [ … ] }
+```
+
+The origin is **the node that wrote the rows**, not the node sending them. A master's
+rows travel master → master → child, and the child's write authority must still be
+evaluated against the master that wrote them. See
+[data-model.md](data-model.md) § "Write authority".
+
+### Paging and message budgets
+
+**A ROWS message is bounded.** The sender stops adding rows when the encoded message
+would exceed `max_message_bytes` (default 4 MiB) and returns a cursor instead:
+
+```jsonc
+// response
+{ "session_id": "…",
+  "rows": [ … ],
+  "next_cursor": { "tbl": "device", "bucket_id": 29681, "level": "hour",
+                   "last_key": "…", "as_of_us": … },
+  "done": false }
+```
+
+The cursor is **deterministic and resumable**: it names the bucket, the last key sent
+within it, and the `as_of_us` the session is running at. Rows within a bucket are
+ordered by their canonical key bytes, so both sides agree on the order without
+exchanging it, and a re-issued ROWS with the same cursor continues exactly where the
+last page stopped. Re-sending a page is harmless — the merge is idempotent.
+
+The same machinery bounds the SUMMARY hash list: a range with more buckets than fit in
+one message is truncated, and the truncated list is always a **prefix** of the full one,
+ordered by `(level, bucket_id)`.
+
+**A session is bounded too.** After `max_rounds_per_session` (default 1000) round trips
+the session ends with `SESSION_LIMIT` — a **retryable** outcome, not a failure. The
+caller re-opens the session with the last cursor and continues. This is what stops a
+pathological peer from holding a session open indefinitely, and what gives the transport
+a natural place to yield.
 
 ### COMMIT
 
@@ -249,8 +364,93 @@ A column whose merge mode is `SetUnion` is merged as a union rather than replace
 default is whole-value replacement, under which a concurrent edit to a JSON array loses
 one side's change. See [data-model.md](data-model.md) § "Set-valued columns".
 
+### Per-table merge policies
+
+The rule above is the **default**, and it is the default for a reason: LWW on
+`(last_update, digest)` is a total order, and a total order is what makes two peers
+converge on the same row.
+
+Some schemas need a different rule — first-allocation-wins on a lease table, an
+epoch-ordered ownership field re-asserted after LWW, a batch repair before apply to
+satisfy a partial unique index. Those are expressed as a **per-table merge policy**:
+
+```rust
+pub trait MergePolicyFn: Send + Sync {
+    fn merge(&self, ctx: &MergeContext<'_>, incoming: &IncomingRow,
+             local: Option<&StoredRow>) -> MergeDecision;
+
+    /// Optional sender-side batch repair, before the rows are replicated.
+    fn prepare(&self, ctx: &MergeContext<'_>, batch: &mut Vec<Row>) -> Result<()>;
+}
+```
+
+Two rules keep a custom policy from breaking convergence, and both are requirements
+rather than advice:
+
+1. **The policy must be pure and convergent.** The same `(incoming, local)` pair must
+   produce the same decision on every peer. It may not consult the wall clock, a
+   node-local counter, or anything else that differs between peers. A policy that
+   decides "the newer wall-clock wins" is the default rule; a policy that decides "the
+   node that has seen the row more times wins" is a divergence generator.
+2. **Batch repair runs on the sender.** A repair applied on the receiving side changes
+   the stored bytes, and therefore the digest — so the two peers would compute different
+   digests for the same logical row and never converge. Repair that is applied on
+   receipt is only safe if it is a deterministic function of the replicated row set
+   that every peer computes identically, which in practice means doing it before the
+   rows are sent.
+
+The digest tie-break remains the fallback: a policy that returns "undecided" falls
+through to LWW on `(last_update, digest)`.
+
+See [data-model.md](data-model.md) § "Merge policies" and
+[adr/0015](adr/0015-per-table-merge-policies-and-write-authority.md).
+
+### Write authority
+
+Not every table is writable by every role. A master-authoritative policy table accepts
+writes from masters and refuses them from children; a site-owned table accepts them
+only from its owner.
+
+The check is made **when the row is applied**, against the **origin** of the row — the
+node that wrote it, which the ROWS batch carries — and not against the node that
+happened to forward it. A row whose origin lacks authority for the table is refused
+with `WRITE_NOT_PERMITTED`, and the table is dropped from the session.
+
+A peer may write a table only if its profile exposes every replicated column of that
+table: a peer that cannot see a column cannot compute the row's digest, and a row it
+cannot digest is a row it must not write.
+
 A row is applied to the user table and to `_sync_log` in one transaction, and the tree is
 updated incrementally.
+
+## The purge quiesce window
+
+Around each purge instant, a node refuses sessions that touch the tables it is about to
+purge:
+
+```
+503 PURGE_IN_PROGRESS
+{ "tables": ["device"], "until_us": … }
+```
+
+**The window is per table, not global.** Before the instant, the node computes the set
+of tables with tombstones due:
+
+```
+due = SELECT DISTINCT tbl FROM _sync_log
+      WHERE purge_on_us IS NOT NULL AND purge_on_us <= T
+```
+
+- If `due` is empty, the purge is a no-op and the node **does not quiesce at all**.
+- If `due` is not empty, only those tables refuse sync; a session about another table
+  proceeds normally.
+
+That is the difference between a daily fleet-wide sync outage and a daily outage of the
+one table that happens to have tombstones due. The `_sync_log.purge_on_us` column exists
+so this check is an indexed existence query rather than a scan of the user tables.
+
+A session refused for a quiescing table may retry after the window closes; nothing is
+lost.
 
 ## Progress
 
@@ -326,6 +526,10 @@ A peer that has fallen out of the retention window must be re-seeded wholesale. 
 the case a human actually waits on, so it gets its own progress path: "row N of M", where
 M is the table's row count from `SELECT count(*)` at the start.
 
+A re-seed is a **merge, not a wipe** — the stale peer pushes its unsynced local rows
+first, then pulls the peer's dataset, and keeps the rows the peer does not have. See
+[lifecycle.md](lifecycle.md) § "What a re-seed does".
+
 ### Persistence
 
 Per-peer progress is written to `_sync_cursors.progress`, so a restarted node can show
@@ -336,8 +540,54 @@ Per-peer progress is written to `_sync_cursors.progress`, so a restarted node ca
 - Sync is **idempotent**. Applying the same row twice is a no-op under LWW.
 - Overlapping sessions between the same pair are fine. Cursors advance monotonically.
 - A session is resumable by re-issuing SUMMARY with the same range.
+- A page is resumable by re-issuing ROWS with the cursor the last page returned.
 - A session that fails mid-ROWS leaves the cursor at its previous value; the next session
   redoes the work. There is no partial-commit state.
+
+## Durable client sessions
+
+A read-only client on an unreliable link needs more than an in-memory session with a
+five-minute TTL: it needs to survive a restart and pick up where it left off.
+
+The client persists its session state in a local, **node-local** table:
+
+```sql
+CREATE TABLE _sync_session (
+    session_id   TEXT PRIMARY KEY,
+    peer_id      TEXT NOT NULL,
+    profile      TEXT NOT NULL,
+    state        TEXT NOT NULL,     -- active | paused | complete
+    cursor       BLOB,              -- the last applied page cursor
+    as_of_us     INTEGER,
+    created_us   INTEGER NOT NULL,
+    updated_us   INTEGER NOT NULL
+);
+```
+
+Received pages are staged before they are applied, so a crash between "received" and
+"applied" loses nothing: the staged rows are applied on restart, and the cursor advances
+only after the transaction commits.
+
+A session with a persisted cursor **survives a restart** — the TTL applies to *idle*
+sessions, not to ones with work outstanding. A restarted client re-opens the session by
+id and asks for the next page.
+
+### Ordering
+
+A client that is catching up after a long outage wants the important tables first:
+
+```rust
+pub struct TableSpec {
+    …
+    /// Lower numbers sync first. Core tables before large history tables.
+    pub sync_priority: u8,
+}
+```
+
+Tables are synced in ascending priority, and within a table the buckets are walked
+**newest-first**, so the data a user is most likely to read lands in the database
+before the history nobody is waiting for. The same ordering applies to the server's
+proactive push in a pull-only session.
 
 ## WebSocket
 
@@ -365,11 +615,21 @@ Sessions are addressed by an opaque `session_id`, held in memory with a 5-minute
 single `POST /v1/sync` with a `step` discriminator is an acceptable simplification if the
 route count matters more than clarity.
 
+A client that needs to survive a restart keeps its session in `_sync_session` and re-opens
+it by id — see § "Durable client sessions".
+
 ## Pull-only clients
 
 A client that only ever receives can use a simplified flow: `HELLO` → the server sends
 the full diff proactively → the client applies → `COMMIT`. The client does not compute
 symmetric differences, and the server drives the progress report directly.
+
+The proactive flow uses the **same page machinery** as the normal one: the server sends
+one bounded page at a time, with a cursor, and the client acknowledges each page before
+the next is sent. A pull-only client therefore has the same byte budget, the same
+resumability, and the same table ordering as a bidirectional peer — which matters,
+because a full diff into one hour of data is exactly the case that used to produce one
+enormous message.
 
 ## Error codes
 
@@ -385,20 +645,30 @@ stable string; the numeric value is an implementation detail.
 | `EPOCH_MISMATCH` | The bucket epoch differs | The deployment was provisioned inconsistently |
 | `DIGEST_SEED_MISMATCH` | The digest seed differs | The wrong seed, or a rotation that did not reach everyone |
 | `SCHEMA_MISMATCH` | The digest inputs differ | A column was added, removed or reordered on one side |
+| `VISIBILITY_MISMATCH` | The visibility profiles differ | The two sides project the data differently |
 | `UNKNOWN_PEER` | The presented UUID is not in the directory | Not provisioned, or revoked |
+| `IDENTITY_MISMATCH` | The claimed UUID is not the identity the transport authenticated | A peer claiming another node's UUID |
 | `BAD_CREDENTIAL` | The credential does not verify for the claimed role | Wrong secret, or a rotated one |
-| `STALE_PEER` | The peer is older than the purge floor | The peer was down across a purge instant |
+| `STALE_PEER` | The peer is older than the staleness horizon | The peer has been offline longer than the retention window and must re-seed |
 
 Every one of these is a **correctness** failure, not a policy difference: continuing
 would mean comparing trees that cannot be compared, or accepting writes from a node that
 should not be writing.
 
+**Missing a purge instant is not in this table.** A peer whose `last_purge_instant` is
+behind ours catches up by purging locally and the session continues. Only the retention
+horizon produces `STALE_PEER`.
+
 ### Non-fatal — the session continues with a caveat
 
 | Code | Meaning | Handling |
 |---|---|---|
-| `COLUMN_NOT_PERMITTED` | A peer asked for a `Restricted` column | The column is dropped; the request is logged |
-| `TABLE_NOT_PERMITTED` | A peer asked for a `client_visible = false` table | The table is dropped |
+| `COLUMN_NOT_PERMITTED` | A peer asked for a column outside its profile | The column is dropped; the request is logged |
+| `TABLE_NOT_PERMITTED` | A peer asked for a table its profile excludes | The table is dropped |
+| `WRITE_NOT_PERMITTED` | A row's origin may not write that table | The row is refused; the table is dropped from the session |
+| `ROW_PURGED` | A tombstone the receiver has already purged | The row is refused; the sender purges it at the next instant |
+| `PURGE_IN_PROGRESS` | The tables being purged are quiescing | The session is refused for those tables; retry after the window |
+| `SESSION_LIMIT` | The session hit `max_rounds_per_session` | **Retryable**: re-open with the last cursor and continue |
 | `UNKNOWN_TABLE` | A peer named a table this node does not sync | Client sessions: sync the intersection. Trusted peers: `SCHEMA_MISMATCH` |
 | `UNKNOWN_COLUMN` | A peer named a column this node does not have | As above |
 | `RANGE_VIOLATION` | A row's identifier is outside its owner's range | The row is refused; the write is logged |
@@ -417,6 +687,9 @@ should not be writing.
 ## Related documents
 
 - [merkle.md](merkle.md) — what is being compared
-- [lifecycle.md](lifecycle.md) — `STALE_PEER` and the purge handshake
+- [lifecycle.md](lifecycle.md) — the staleness rule and the purge handshake
+- [data-model.md](data-model.md) — merge policies, write authority and visibility profiles
 - [security.md](security.md) — handshake validation as part of the trust model
-- [adr/0009](adr/0009-progress-has-no-eta.md)
+- [adr/0009](adr/0009-progress-has-no-eta.md) ·
+  [adr/0015](adr/0015-per-table-merge-policies-and-write-authority.md) ·
+  [adr/0018](adr/0018-bounded-messages-paged-transfer-and-durable-client-sessions.md)

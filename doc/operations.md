@@ -17,8 +17,12 @@ replicas.
 
 ### Multi-master mesh
 
-Masters at different sites replicate to each other. Safe because the site is part of the
-key — see [architecture.md](architecture.md) § "Multi-master and the conflict domain".
+Masters at different sites replicate to each other. The sites are peers over one shared
+dataset, so two masters can write the same logical row — and LWW resolves it. See
+[architecture.md](architecture.md) § "Multi-master and the conflict domain".
+
+For tables that are genuinely per-site, use `KeyStrategy::SiteNamespaced`, which keeps
+each site's rows in its own namespace so they never contend.
 
 Each master still needs its own children and clients.
 
@@ -31,15 +35,23 @@ sync engine is idle; the store still enforces its invariants.
 
 ### Clock synchronisation
 
-**All nodes must run NTP or chrony and agree within ±1 second.**
+**All nodes must run NTP or chrony and agree within `max_skew`** — 5 seconds by
+default.
 
 This is a hard requirement, not a recommendation. It underpins:
 
 - LWW ordering — a skewed clock can prefer a write that happened earlier in real time;
-- bucket boundaries — ±1 s against an hour-long bucket is irrelevant, but the purge
-  instant is wall-clock aligned, so skew shifts *when* a node purges by up to ±1 s (which
-  the quiesce window absorbs);
+- bucket boundaries — a few seconds against an hour-long bucket is irrelevant, but the
+  purge instant is wall-clock aligned, so skew shifts *when* a node purges by that much
+  (which the quiesce window absorbs);
 - the monotonic issuance guard, which assumes the clock is roughly monotonic.
+
+The default of 5 s is deliberate. A one-second threshold is tighter than the clock
+discipline a set of geographically distributed sites can actually guarantee, and
+refusing a peer that is 1.2 s out rejects sessions that would have been perfectly
+ordered. The tolerance is still far below the granularity that matters for LWW here,
+and it is a **local** setting: two nodes may disagree about it without breaking
+anything.
 
 The crate exposes `clock_offset_estimate_us`, measured against peers at handshake, so a
 node can log its own skew and refuse peers it believes are more than `max_skew` away.
@@ -107,9 +119,12 @@ The crate exposes counters and gauges for a Prometheus-style scrape:
 |---|---|---|
 | `sync_rows_sent_total` | counter | Rows transmitted |
 | `sync_rows_received_total` | counter | Rows applied |
+| `sync_rows_purged_rejected_total` | counter | Rows refused because the receiver had already purged them |
+| `sync_rows_write_refused_total` | counter | Rows refused because their origin lacked write authority |
 | `sync_bytes_total` | counter | Bytes transferred |
 | `sync_sessions_active` | gauge | Sessions in flight |
 | `sync_session_duration_seconds` | histogram | Session wall time |
+| `sync_sessions_limit_total` | counter | Sessions ended by `max_rounds_per_session` |
 | `sync_buckets_compared_total` | counter | Bucket comparisons |
 | `sync_buckets_differing_total` | counter | Bucket comparisons that differed |
 | `sync_purge_rows_total` | counter | Rows removed by purge |
@@ -152,9 +167,22 @@ It has been offline longer than the retention window. This is by design — it c
 trusted to sync incrementally, because it may hold rows whose deletions were purged
 before it heard about them.
 
-The remedy is a re-seed: the peer discards its synced state and rebuilds from the
-master. Expect this to take a while and to transfer a lot of data; that is the cost of a
-long outage.
+The remedy is a re-seed. A re-seed is a **merge, not a wipe**: the stale peer pushes its
+unsynced local writes to the peer, then pulls the peer's full dataset, and keeps the
+rows the peer does not have. Nothing local is thrown away — in particular, a child that
+was the primary for its own site while offline keeps those writes. Expect the transfer
+to take a while and to move a lot of data; that is the cost of a long outage.
+
+**A peer that merely missed a purge instant is not stale.** It catches up by purging
+locally and continues in the same session; there is no error and no re-seed.
+
+### A session ends with `SESSION_LIMIT`
+
+The session hit `max_rounds_per_session` — a **retryable** outcome, not a failure. Re-open
+the session with the last cursor and continue. If it happens on every session, the
+diff is larger than the round limit allows; raise the limit, or lower
+`max_message_bytes` so that pages are smaller and more of the work fits in the same
+number of rounds.
 
 ### A peer is refused with `EPOCH_MISMATCH` or `DIGEST_SEED_MISMATCH`
 
@@ -174,8 +202,13 @@ crate's connection factory.
 
 ### Sync is refused with `PURGE_IN_PROGRESS`
 
-Expected during the quiesce window around a purge instant. It lasts `purge_quiesce`
-seconds, by default 60.
+Expected during the quiesce window around a purge instant, and **only for the tables
+being purged**. The window lasts `purge_quiesce` seconds, by default 60.
+
+If it happens every day at the same time for the whole fleet, the node is purging a table
+every instant. If it happens for a table that has no tombstones due, that is a bug — the
+due set is computed from `_sync_log.purge_on_us`, and an empty set means no quiesce at
+all.
 
 ### Everything is slow
 

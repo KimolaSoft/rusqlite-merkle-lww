@@ -75,6 +75,11 @@ documentation rather than silently changing the contract.
   Assert the staleness rule refuses B, and that after re-seed both agree K is gone.
 - A deletes K. B is offline for **less** than the retention. B returns. Assert the
   tombstone is still present and B applies the delete on reconnect.
+- **A live row is never refused by the purge floor.** Push a row whose `last_update` is
+  older than the receiver's `last_purge_instant` — under a daily purge, that is most
+  rows — and assert it is accepted.
+- **A tombstone the receiver has already purged is refused** with `ROW_PURGED`, and the
+  sender purges it at the next instant.
 
 ### 6. Purge
 
@@ -82,10 +87,16 @@ documentation rather than silently changing the contract.
   locally before syncing and does not re-push stale copies.
 - Assert all nodes purge the same set at the same instant.
 - Assert sync is refused with `PURGE_IN_PROGRESS` during the quiesce window.
+- **The quiesce window is per table.** Assert that a session about a table with no
+  tombstones due proceeds while another table is quiescing, and that a node with
+  nothing due does not quiesce at all.
+- **Missing a purge instant is not fatal.** A peer whose `last_purge_instant` is behind
+  catches up and the session continues; no error is raised.
 
 ### 7. Clock skew
 
-- Inject ±1 s skew. Assert convergence is unaffected.
+- Inject ±5 s skew — the default `max_skew`. Assert convergence is unaffected.
+- Inject a skew beyond `max_skew`. Assert the peer is refused.
 - Assert the monotonic issuance guard prevents a backwards clock from regressing a row:
   a write after a clock step still gets a `last_update` greater than the previous one.
 
@@ -105,9 +116,18 @@ documentation rather than silently changing the contract.
   anywhere in the wire bytes, in any log line, or in any error message. **This test must
   never regress.**
 - Assert a client requesting a restricted column is rejected.
-- Assert a table marked `client_visible = false` is absent from the client's handshake.
+- Assert a table excluded by the client's profile is absent from the client's handshake.
 - Assert the client cannot recompute a digest, and that a brute-force over a
   low-entropy restricted value does not produce a matching bucket hash.
+- **The profiles**, each asserted separately:
+  - a credential column is visible master↔master and **not** to children;
+  - a payload column is withheld from a client profile;
+  - a table is excluded from one role and included in another;
+  - a per-peer profile override gives one client a narrower view than the others;
+  - a profile may never expose a `Restricted` column to an untrusted profile.
+- **`visibility_hash`**: two trusted peers with different profile definitions are
+  refused at handshake with `VISIBILITY_MISMATCH`; a client does not compare it and
+  does not fail.
 
 ### 11. Key strategies
 
@@ -178,6 +198,13 @@ language can implement the same format.
   database bytes, not by inspecting the API.
 - **A schema mismatch is fatal for a trusted peer and a warning for a client**: two
   trusted peers differing only in registered column order are rejected at handshake.
+- **The authenticated identity binds to the claimed node id**: a HELLO whose `node_id`
+  differs from the identity the transport authenticated is refused with
+  `IDENTITY_MISMATCH`.
+- **Per-node credentials attribute the session**: with `PerNodeSecret`, the
+  authenticating node is known, and the audit table records it.
+- **The audit table is local and optional**: it is never replicated, never in the
+  digest, and enabling it does not change a single stored digest.
 
 ### 18. Site registry and allocation
 
@@ -198,6 +225,63 @@ language can implement the same format.
   insert leaves a gap rather than a reusable id.
 - **A decommissioned site's range is retired**: after the site is soft-deleted, its range
   is never reissued.
+- **The allocator is optional**: a deployment with no `AllocationSpec` has no registry
+  table, no `site` column, no range trigger, and no REGISTRY phase — and it syncs
+  correctly. The crate builds without the `alloc` feature.
+
+### 19. Merge policies and write authority
+
+- **The default is LWW**, and the default is what runs when no policy is declared.
+- **A custom policy converges.** Run the convergence suite with a custom policy in the
+  loop — first-allocation-wins on a lease table — and assert the nodes agree on the
+  winner. A non-convergent policy is a bug in the policy, and this test is how it is
+  caught.
+- **An epoch-ordered ownership field is re-asserted after LWW**: the higher epoch wins
+  the ownership field even when the lower epoch won the row.
+- **Batch repair runs on the sender**: the repair is applied before replication, both
+  peers store the same bytes, and the digests agree. A receiver-side repair would
+  diverge — asserted by checking that the digests match after a repaired batch.
+- **Write authority is evaluated against the origin**: a row written by a child for a
+  `MasterOnly` table is refused with `WRITE_NOT_PERMITTED`, even when it arrives via a
+  master.
+- **A peer may not write a table whose columns its profile hides.**
+- **A policy that returns "undecided" falls through to the LWW + digest tie-break.**
+
+### 20. Paging and message budgets
+
+- **No message exceeds `max_message_bytes`**, whatever the batch size.
+- **A page is resumable**: re-issuing a ROWS with the returned cursor continues exactly
+  where the last page stopped, and the transfer converges to the same state as an
+  unpaged one.
+- **Re-sending a page is harmless** — the merge is idempotent.
+- **The SUMMARY hash list is truncated as a prefix**, and the two sides still agree on
+  the differing set.
+- **The round limit is retryable**: a session that hits `max_rounds_per_session` ends
+  with `SESSION_LIMIT`, and re-opening it with the last cursor continues the transfer.
+- **The pull-only client flow uses the same bounds**: the server's proactive push is
+  paged, and the client applies every page.
+
+### 21. Re-seed
+
+- **A stale peer keeps its unsynced local writes.** A child accepts writes while
+  offline, goes stale, and re-seeds. Assert the writes are present afterwards, and that
+  the peer has them too.
+- **The push happens before the pull**, so the peer's older copy of the child's row
+  does not overwrite it.
+- **A re-seed does not resurrect a purged tombstone**: the stale peer purges locally to
+  the peer's instant first, and the tombstone is gone from both sides afterwards.
+- **Live rows the peer does not have are kept**, not deleted.
+- **A client re-seed is a pull** — it has no local writes, and the result is the same.
+
+### 22. Durable client sessions
+
+- **A client resumes after a restart**: interrupt a transfer mid-page, restart the
+  client, and assert it continues from its cursor rather than starting again.
+- **The cursor advances only after the commit**: a crash between "received" and
+  "applied" loses nothing — the staged rows are applied on restart.
+- **The session survives the idle TTL** when it has a persisted cursor.
+- **Ordering**: tables are synced in `sync_priority` order — core tables first — and
+  within a table the newest buckets arrive first.
 
 ## Testing the SQLite mechanics
 
@@ -245,9 +329,9 @@ Each phase of [../PLAN.md](../PLAN.md) is measured against these suites:
 | 0 — Foundations | 14, and the allocator's "never reused" property |
 | 1 — Store and enforcement | 2, 3, 13, 18 |
 | 2 — Merkle tree | tree units, and the incremental-vs-rebuild property |
-| 3 — Diff engine | 1, 8, 9 |
-| 4 — Transport | 12, 15, 17 |
-| 5 — Lifecycle | 5, 6 |
+| 3 — Diff engine | 1, 8, 9, 19 |
+| 4 — Transport | 12, 15, 17, 20, 22 |
+| 5 — Lifecycle | 5, 6, 21 |
 | 6 — Hardening | 4, 7, 10, 11, and the full suite |
 
 The numbering refers to the suites above. Phase 2's criteria are not numbered because

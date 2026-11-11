@@ -105,8 +105,14 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | [0010](adr/0010-no-orm-query-wrapper.md) | No ORM; the crate owns the connection, not the query language |
 | [0011](adr/0011-crate-provides-the-exchange.md) | The crate provides the exchange; the application provides the transport |
 | [0012](adr/0012-sync-key-is-the-applications-key.md) | The sync key is the application's key when it is globally unique and stable |
-| [0013](adr/0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier |
-| [0014](adr/0014-peer-credentials-and-the-uuid-directory.md) | Role-level credentials, a master-issued UUID directory, and a separate digest seed |
+| [0013](adr/0013-site-registry-and-range-allocation.md) | A site registry in the main database; a row names the site that owns its identifier *(superseded by 0019)* |
+| [0014](adr/0014-peer-credentials-and-the-uuid-directory.md) | Role-level credentials, a master-issued UUID directory, and a separate digest seed *(superseded by 0020)* |
+| [0015](adr/0015-per-table-merge-policies-and-write-authority.md) | Per-table merge policies, and write authority evaluated against the row's origin |
+| [0016](adr/0016-visibility-profiles-mapped-to-peer-roles.md) | Visibility profiles mapped to peer roles, hashed separately from the schema |
+| [0017](adr/0017-re-seed-is-a-merge-not-a-wipe.md) | A re-seed merges; it never discards a peer's unsynced local writes |
+| [0018](adr/0018-bounded-messages-paged-transfer-and-durable-client-sessions.md) | Bounded messages, paged transfer, and durable client sessions |
+| [0019](adr/0019-the-allocation-registry-is-optional.md) | The site registry and the allocator are optional |
+| [0020](adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | The application's authenticated identity binds to the claimed node id; per-node credentials and attribution are optional |
 
 ## Conventions used throughout
 
@@ -115,8 +121,11 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 - **`MAY`** — optional.
 - **"the peer"** — any node this node talks to, regardless of role.
 - **"the node"** — this process, as a peer.
+- **"the origin"** — the node that *wrote* a row, which is not necessarily the node that
+  sent it. Every ROWS batch carries it.
 - **"`last_update`"** — the RFC 3339 text form, e.g. `2026-11-24T17:24:03.302238Z`.
-- **"`hlc_us`"** — the same instant as an integer, microseconds since the Unix epoch.
+- **"`last_update_us`"** — the same instant as an integer, microseconds since the Unix
+  epoch. It is what `_sync_log` stores; it is not a second clock.
 
 ## Terminology
 
@@ -129,12 +138,19 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | **managed table** | A table the crate syncs, and for which it owns columns, triggers and DDL |
 | **managed column** | A column the crate owns: `last_update`, `status`, `purge_on`, and sometimes the key column |
 | **dialect** | Which trigger flavour is in use: *enforced* (Rust UDF) or *compatible* (pure SQL) |
-| **quiesce window** | The interval around a purge instant during which sync is refused |
+| **quiesce window** | The interval around a purge instant during which the tables being purged refuse sync |
 | **purge instant** | The globally scheduled moment at which tombstones are removed |
+| **purge floor** | The rule that refuses a tombstone the receiver has already purged. It applies to tombstones only |
+| **catch-up purge** | Purging locally to a peer's newer `last_purge_instant`. Routine, not an error |
 | **absence** | A key not present in `_sync_log` — either never existed, or purged |
 | **staleness horizon** | How long a peer may be offline before it must re-seed rather than sync incrementally |
 | **site** | A deployment location. Part of the key under the `SiteNamespaced` strategy; an ordinary column under `GlobalId` |
 | **digest seed** | The deployment secret the digest is keyed with; shared by trusted peers, absent from clients |
+| **visibility profile** | A named projection of the schema: which tables and columns a class of peer may see |
+| **projection** | A profile resolved to a concrete table → column list, for one session |
+| **merge policy** | How two versions of a row are reconciled. LWW by default; per-table and extensible |
+| **write authority** | Which roles may write a given table, evaluated against the row's origin |
+| **page cursor** | The resumable position in a paged transfer: the bucket, the last key, and the `as_of_us` |
 
 ## Status of this documentation
 

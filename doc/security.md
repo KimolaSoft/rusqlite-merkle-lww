@@ -7,8 +7,8 @@ threat model is:
 
 - **Trusted**: masters and children. They hold the full dataset, including restricted
   columns. They authenticate to each other.
-- **Untrusted**: read-only clients. They hold a subset — restricted columns are never
-  transmitted to them — and they cannot write.
+- **Untrusted**: read-only clients. They hold a subset — whatever their **visibility
+  profile** allows, which never includes a restricted column — and they cannot write.
 
 The design assumes the deployment's operators are not adversaries to each other. It does
 not assume the network is friendly, and it does not assume a client is honest about what
@@ -71,6 +71,10 @@ pub enum PeerAuth {
     /// A role-level shared secret, compared in constant time.
     RoleSecret { role: Role, secret: SecretString },
 
+    /// A per-node secret. Each node has its own; the holder learns *which* node
+    /// authenticated, which role-level credentials cannot tell them.
+    PerNodeSecret { node_id: Uuid, secret: SecretString },
+
     /// Client certificate subject/SAN, checked against the presented certificate.
     ClientCert { subject: String },
 
@@ -79,7 +83,7 @@ pub enum PeerAuth {
 }
 ```
 
-Two strings exist:
+Two strings exist by default:
 
 | String | Held by | Authenticates |
 |---|---|---|
@@ -89,10 +93,15 @@ Two strings exist:
 `SecretString` is a wrapper that does not implement `Debug` as its contents, so secrets do
 not leak into logs or error messages. That is the whole reason to have it.
 
-Because the credentials are **role-level**, every master is cryptographically identical to
-every other master. The deployment gets **authorization and revocation**, but not
-**attribution** — nothing can prove which master wrote a given row. Per-node credentials
-or signing keys would be needed for that.
+Because the default credentials are **role-level**, every master is cryptographically
+identical to every other master. The deployment gets **authorization and revocation**,
+but not **attribution** — nothing can prove which master wrote a given row.
+
+`PerNodeSecret` is the opt-in that closes that gap: each node holds a secret only it
+knows, so a session identifies exactly which node is on the other end. It costs an
+N×M secret distribution, which is why it is not the default — but a deployment that
+needs attribution can turn it on per peer, and the crate does not care which mode a
+given peer uses. See § "Attribution".
 
 ### The directory is the child security boundary
 
@@ -110,9 +119,57 @@ At handshake, the node verifies three things:
 
 1. the presented `node_id` is in its directory — otherwise `UNKNOWN_PEER`;
 2. the credential verifies for the role the peer claims — otherwise `BAD_CREDENTIAL`;
-3. the deployment state matches — epoch, digest seed, schema hash, codec version.
+3. the deployment state matches — epoch, digest seed, schema hash, visibility hash,
+   codec version.
 
 The crate compares a token itself; certificate validation is the transport's job.
+
+### The authenticated identity
+
+The crate does not implement authentication — the application does, with whatever it
+already uses. What the crate does is **bind the identity the application established to
+the node id the peer claims**:
+
+```rust
+SessionContext {
+    authenticated_peer:   Some(node_id),    // who the transport says this is
+    authenticated_subject: Some("spiffe://…"), // for logs and for the audit record
+}
+```
+
+When `authenticated_peer` is set, the `node_id` in the HELLO **must** equal it, or the
+session is refused with `IDENTITY_MISMATCH`.
+
+This matters because role-level credentials cannot tell two masters apart. Without the
+binding, any master can present any other master's UUID and be accepted as it — the
+directory says the UUID *exists*, not that this *connection* is that node. The
+application's own authentication is what makes the claim checkable, and the crate makes
+it checked rather than advisory.
+
+The subject is carried through into the session, and into the audit record when one is
+enabled. It is **not** replicated: it is not part of any row, and it does not enter the
+digest.
+
+### Attribution
+
+Attribution means being able to say **which node wrote a row**. There are three levels,
+and the crate supports all three:
+
+| Level | Mechanism | Cost |
+|---|---|---|
+| **None** | Role-level credentials — every master is identical | Free |
+| **Session-level** | `PerNodeSecret`, or the application's authenticated identity | A secret per node, or an identity the application already has |
+| **Row-level** | The optional `_sync_audit` table, recording which peer applied which row | A row per applied row, on each node that applies it |
+
+The audit table is **node-local, not replicated, and not in the digest**, so enabling it
+cannot affect convergence. It records what *this node* knows: the peer that wrote each
+row it applied. A node can only vouch for the rows it applied itself — that is the
+honest limit of attribution in a replicated system, and it is why the audit is a local
+record rather than a replicated column.
+
+An audit row that *were* replicated would change the digest, and a column that differs
+between two peers holding the same logical row is exactly the divergence this design
+spends its effort avoiding.
 
 ### Mutual authentication with one secret
 
@@ -128,10 +185,10 @@ child:            verify PROOF against its own child_string
 
 ### Secrets are not stored
 
-The digest seed and the role strings are supplied by the application as configuration.
-The crate holds them in memory for the life of the process and **writes none of them to
-the database** — including the digest seed, which an earlier revision stored in
-`_sync_meta`.
+The digest seed and the credential strings — role-level or per-node — are supplied by the
+application as configuration. The crate holds them in memory for the life of the process
+and **writes none of them to the database** — including the digest seed, which an earlier
+revision stored in `_sync_meta`.
 
 The database is replicated, inspected, backed up and shipped around. It is the wrong place
 for the material that authenticates a peer. The consequence is that the crate has **no
@@ -169,35 +226,43 @@ What the crate must do either way:
 TLS protects data in transit. It does not decide *who may see which column*. That is the
 visibility model, below.
 
-## Restricted columns
+## Restricted columns and visibility profiles
 
 ```rust
 pub enum Visibility {
-    /// Sent to any peer, including read-only clients.
+    /// Visible to every profile.
     Public,
-    /// Stored and synced between trusted peers only. Never transmitted to a client.
+    /// Visible only to trusted profiles. Never transmitted to a client.
     Restricted,
 }
 ```
 
+The column classification is the **default** projection; a **visibility profile** is the
+authoritative one. A profile is a named set of tables and columns, mapped to a role and
+overridable per peer:
+
 | Peer class | Public columns | Restricted columns | May write |
 |---|---|---|---|
-| **Trusted** (master, child) | yes | yes | yes |
-| **Client** (read-only) | no¹ | **no** | no |
+| **Trusted** (master, child) | yes, per its profile | yes, per its profile | yes, subject to `write_authority` |
+| **Client** (read-only) | yes, per its profile | **no** | no |
 
 ¹ Only columns marked `replicated = true` are sent at all. A column that is not
 replicated is local-only and is not part of the sync payload.
 
+A table is excluded from a class of peer by the profile's per-table `visible` flag. The
+profile is the single source of truth, so there is no separate `client_visible` switch
+that could disagree with it.
+
 ### Enforcement points
 
-The restricted-column rule must hold at every point where data leaves the node:
+The profile rule must hold at every point where data leaves the node:
 
-1. **Row payload.** The server filters outgoing row payloads by peer class. Restricted
-   values are never serialised for a client — not in the row payload, not in an error
-   message, not in a `SELECT`.
-2. **Table list.** Tables with `client_visible = false` are excluded from client sessions
-   entirely, so their existence and shape are not advertised.
-3. **Handshake.** A client that requests a `Restricted` column is rejected with
+1. **Row payload.** The server filters outgoing row payloads by the session's profile.
+   A value outside the profile is never serialised — not in the row payload, not in an
+   error message, not in a `SELECT`.
+2. **Table list.** Tables excluded by the profile are absent from the session entirely,
+   so their existence and shape are not advertised.
+3. **Handshake.** A peer that requests a column outside its profile is rejected with
    `COLUMN_NOT_PERMITTED`.
 4. **The digest seed.** Never sent to a client. Without it, a client cannot compute or
    verify any digest.
@@ -207,6 +272,9 @@ The restricted-column rule must hold at every point where data leaves the node:
    database. The cache is therefore safe to share between peer classes, as long as
    filtering happens at the boundary — which it must anyway, because the wire format is
    the only place the distinction exists.
+6. **Write authority.** A peer may write a table only if its profile exposes every
+   replicated column of it: a peer that cannot see a column cannot compute the row's
+   digest, and a row it cannot digest is a row it must not write.
 
 Point 5 is worth stating explicitly because it is the one that is easy to get wrong: the
 filter belongs at serialisation, not at storage.
@@ -240,7 +308,7 @@ error, and the range check will reject the affected rows.
 
 The registry is also the one place where the deployment's *structure* is visible: which
 sites exist, and which identifiers belong to which of them. A client that should not see
-that can mark the `sites` table `client_visible = false`.
+that can exclude the `sites` table from its profile.
 
 ### A client that cannot write
 
@@ -303,16 +371,18 @@ would mean guessing.
 
 - **It does not encrypt data at rest.** That is the database's business, and SQLite's
   own mechanisms or the filesystem's.
-- **It does not implement authentication.** It checks a credential it is given; producing
-  and validating credentials is the deployment's business.
-- **It does not implement authorisation within the application.** Only the
-  public/restricted distinction is modelled.
+- **It does not implement authentication.** It checks a credential it is given, and it
+  binds the identity the application established to the node id the peer claims;
+  producing and validating credentials is the deployment's business.
+- **It does not implement authorisation within the application.** The visibility
+  profiles and the write authority are the whole model; anything finer is the
+  application's own layer.
 - **It does not defend against a malicious trusted peer.** A trusted peer that lies about
   row contents will be believed, because it is trusted. The digest makes accidental
   divergence visible; it does not make a hostile peer safe.
 
-That last point is a real limitation and worth stating plainly: the restricted-column
-model protects against *over-broad reads*, not against a compromised master.
+That last point is a real limitation and worth stating plainly: the visibility model
+protects against *over-broad reads*, not against a compromised master.
 
 ## Related documents
 
@@ -321,4 +391,6 @@ model protects against *over-broad reads*, not against a compromised master.
 - [protocol.md](protocol.md) — handshake validation
 - [config.md](config.md) — where the seed and peer list live
 - [adr/0004](adr/0004-digest-is-always-computed-and-keyed.md) ·
-  [adr/0008](adr/0008-two-peer-identity-layers.md)
+  [adr/0008](adr/0008-two-peer-identity-layers.md) ·
+  [adr/0016](adr/0016-visibility-profiles-mapped-to-peer-roles.md) ·
+  [adr/0020](adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md)
