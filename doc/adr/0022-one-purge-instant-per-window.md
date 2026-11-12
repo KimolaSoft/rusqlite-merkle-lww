@@ -92,7 +92,7 @@ when it becomes live again, and a direct write to it is denied. A live row has n
 
 - **The purged set is computed, not negotiated.** Every node derives the same set from
   the same schedule.
-- **The purge is a constant predicate**, which is what makes it a single bulk `DELETE`
+- **The purge is a single predicate**, which is what makes it a single bulk `DELETE`
   rather than a scan.
 - **A deployment can choose when the purge happens** without disturbing the bucket
   boundaries, because the offset is independent of the epoch.

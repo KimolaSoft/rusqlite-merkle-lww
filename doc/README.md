@@ -16,7 +16,7 @@ cause divergence rather than errors.
 ### [architecture.md](architecture.md)
 
 The shape of the system: roles (master / child / client), the peer topology, the crate
-layout, the threading model, the division of transport responsibility, and how the
+graph, the threading model, the division of transport responsibility, and how the
 pieces fit together.
 
 ### [data-model.md](data-model.md)
@@ -72,7 +72,7 @@ and how the config is supplied by the consuming application.
 ### [testing.md](testing.md)
 
 The test strategy, the suite that matters most (convergence), the enforcement suite, and
-the acceptance criteria each implementation phase is measured against.
+the acceptance criteria each crate is measured against.
 
 ### [operations.md](operations.md)
 
@@ -115,6 +115,8 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | [0020](adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | The application's authenticated identity binds to the claimed node id; per-node credentials and attribution are optional |
 | [0021](adr/0021-re-seed-is-a-wipe.md) | A re-seed is a wipe; a stale peer pulls and never pushes |
 | [0022](adr/0022-one-purge-instant-per-window.md) | One purge instant per window, and a deployment-wide purge offset |
+| [0023](adr/0023-json-wire-format-and-transport-compression.md) | JSON is the wire format; compression is a transport concern |
+| [0024](adr/0024-the-workspace-is-split-into-six-crates.md) | The workspace is split into six crates |
 
 ## Conventions used throughout
 
@@ -161,4 +163,5 @@ SQLite behaviour rather than assumed, the verification is recorded in
 [sqlite-interface.md](sqlite-interface.md) § "Verified SQLite behaviour" and summarised in
 the relevant ADRs. Everything else is reasoned but not yet exercised by code.
 
-Open questions are tracked in [../PLAN.md](../PLAN.md) § "Open questions".
+Open questions are tracked in [../PLAN.md](../PLAN.md) § "Open questions", and the work
+is sequenced in one plan per crate under [../plan/](../plan/).

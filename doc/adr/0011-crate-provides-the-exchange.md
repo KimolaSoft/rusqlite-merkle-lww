@@ -36,8 +36,11 @@ expensive to diagnose.
 The core exposes the exchange as a transport-agnostic operation:
 
 ```rust
-let report = db.perform_exchange(peer, transport).await?;
+let report = db.perform_exchange(peer, transport)?;
 ```
+
+The core is **synchronous**; an async caller moves the call off the reactor thread with
+`spawn_blocking`.
 
 The `transport` is anything that can carry request and response messages. The crate does
 not know or care whether that is an HTTP body, a WebSocket frame, or a message queue.

@@ -1,7 +1,12 @@
 # The wire protocol
 
-JSON on the wire. The same message set is used over REST and WebSocket; a binary
-encoding (postcard) is a possible later addition.
+JSON on the wire, wire version `merkle-lww/1`. The same message set is used over REST
+and WebSocket.
+
+**Compression is not part of the protocol.** A transport may apply a content encoding —
+`merkle-lww-axum` enables zstd level 1 by default — but the encoding is negotiated at
+the transport layer, and both peers must agree. See
+[ADR-0023](adr/0023-json-wire-format-and-transport-compression.md).
 
 ## Roles in a session
 
@@ -15,6 +20,91 @@ encoding (postcard) is a possible later addition.
 "Pull-only" is a role flag, not a separate protocol. In a bidirectional session the
 upload and download phases are interleaved in one ROWS step — each side sends its
 differing rows and receives the peer's — so there is no separate push API.
+
+## Message encoding
+
+This section is normative. It defines how a value, a row and a message are represented.
+
+### Values
+
+SQLite is dynamically typed, and the digest distinguishes `INTEGER` from `REAL` and
+`TEXT` from `BLOB`. The wire must distinguish them too:
+
+| Type | On the wire |
+|---|---|
+| NULL | `null` |
+| INTEGER | a JSON number in **integral syntax** — no fraction, no exponent |
+| REAL | `{"$f": <JSON number>}` |
+| TEXT | a JSON string |
+| BLOB | `{"$b": "<base64>"}` — RFC 4648, standard alphabet, padded |
+
+A plain JSON number with a fraction or an exponent is an **error**. A producer that
+means `REAL` must write `{"$f": …}`. The asymmetry is deliberate: integers are the
+common case and stay plain, while the two cases JSON cannot express unambiguously are
+wrapped.
+
+### Rows
+
+A row's values are a **positional array**, in the order given by the **projection** for
+that table — not an object keyed by column name. The columns are declared once, in the
+handshake, with their names and types.
+
+```
+mode = "digest":  "rows": [ [ <key>, <digest> ], … ]
+mode = "row":     "rows": [ [ <key>, <digest>, [ <value>, … ] ], … ]
+```
+
+- `<key>` is the canonical key, base64.
+- `<digest>` is the 16-byte digest, big-endian, base64.
+- `<value>` is a value in the form above.
+
+The **digest is present in both modes**. It is required in `row` mode because a peer
+whose projection is narrower than the table's replicated column set cannot recompute
+it, and because a peer that *can* recompute it should, as a check.
+
+A peer with the full projection recomputes the digest from the received values and
+compares it with the one it was sent. A peer with a narrower projection accepts the
+digest verbatim and never recomputes it. See
+[ADR-0016](adr/0016-visibility-profiles-mapped-to-peer-roles.md).
+
+### The handshake declares the columns
+
+```
+"tables": [ { "name": "device",
+              "kind": "keyed",
+              "key": { "strategy": "global_id", "key_columns": ["id"] },
+              "columns": [ { "name": "payload", "type": "text",
+                             "replicated": true, "visibility": "public" },
+                           { "name": "secret",  "type": "blob",
+                             "replicated": true, "visibility": "restricted" } ],
+              "write_authority": "any" } ]
+```
+
+The **projection** is the ordered list of columns a session actually carries, and the
+row array follows it:
+
+```
+"projection": [ { "table": "device",
+                   "columns": [ { "name": "payload", "type": "text" } ] } ]
+```
+
+The projection's **order is the row array's order**, and it carries each column's
+**type** — so a projection is self-sufficient for decoding a row, and a client that
+does not have the table registered can still apply one. A peer decodes a row by
+walking the projection, not the table's full column list — which is what lets a narrow
+peer decode a row it could not have computed a digest for.
+
+### Unknown fields are ignored
+
+A receiver ignores a field it does not know. That is what makes the format extensible
+without a version bump for every addition.
+
+### The byte budget
+
+`max_message_bytes` is measured on the **JSON message**, before any transport-level
+content encoding. The budget bounds the crate's page-assembly work and its staged-page
+writes, so it is measured on the message the crate produces. Compressed bytes are
+always fewer, so the wire is never the binding constraint.
 
 ## Handshake
 
@@ -37,18 +127,22 @@ differing rows and receives the peer's — so there is no separate push API.
                 "kind": "keyed",
                 "key": { "strategy": "global_id",
                          "key_columns": ["id"] },
-                "columns": [ { "name": "payload", "replicated": true,
+                "columns": [ { "name": "payload", "type": "text",
+                               "replicated": true,
                                "visibility": "public" },
-                             { "name": "secret", "replicated": true,
+                             { "name": "secret", "type": "blob",
+                               "replicated": true,
                                "visibility": "restricted" } ],
                 "write_authority": "any" },
               { "name": "sites",
                 "kind": "keyed",
                 "key": { "strategy": "global_id",
                          "key_columns": ["site_id"] },
-                "columns": [ { "name": "uid_start", "replicated": true,
+                "columns": [ { "name": "uid_start", "type": "integer",
+                               "replicated": true,
                                "visibility": "public" },
-                             { "name": "uid_end", "replicated": true,
+                             { "name": "uid_end", "type": "integer",
+                               "replicated": true,
                                "visibility": "public" } ],
                 "write_authority": "master_only" } ],
   "schema_hash": "…",
@@ -73,8 +167,12 @@ columns ([data-model.md](data-model.md) § "Visibility profiles"). The profile i
 resolved during the handshake, and the resolved **projection** is sent to the peer:
 
 ```jsonc
-"projection": [ { "table": "device", "columns": ["payload"] } ]
+"projection": [ { "table": "device",
+                   "columns": [ { "name": "payload", "type": "text" } ] } ]
 ```
+
+The projection's **order is the row array's order** — see § "Message encoding" — and it
+carries each column's type, so a projection is self-sufficient for decoding a row.
 
 For a trusted peer the projection is the whole registered schema and the two sides
 compare `visibility_hash`. For a client session the server sends the projection for the
@@ -110,7 +208,7 @@ A client sends no directory and receives none.
 | credential does not verify for the claimed role | `BAD_CREDENTIAL` |
 | `as_of_us` differs by more than the tolerance | the server's wins; the client adopts it |
 | `last_sync_us` — peer is older than the staleness horizon | `STALE_PEER` — the peer must re-seed, and the session is **pull-only** (see [lifecycle.md](lifecycle.md)) |
-| `purge_period_us` or `purge_offset_us` differs | `PURGE_SCHEDULE_MISMATCH` — fatal; the peers would purge different sets at different moments |
+| `retention_us`, `purge_period_us` or `purge_offset_us` differs | `PURGE_SCHEDULE_MISMATCH` — fatal; the peers would purge different sets at different moments |
 | `last_purge_instant` — peer is newer than ours | **not a failure**: the local node catches up by purging locally, then syncs |
 | `last_purge_instant` — peer is older than ours | **not a failure**: the peer catches up on its side; the local node says so in the handshake |
 | peer requests a column outside its profile | `COLUMN_NOT_PERMITTED` |
@@ -270,12 +368,22 @@ Every ROWS batch carries the **origin** of the rows it contains:
   "origin": { "node_id": "…", "role": "child", "site": "eu-west" },
   "cursor": { "tbl": "device", "bucket_id": 29681, "level": "hour",
               "last_key": "…", "as_of_us": … },
-  "rows": [ … ] }
+  "rows": [ [ "<base64 key>", "<base64 digest>" ], … ] }
 ```
 
-The origin is **the node that wrote the rows**, not the node sending them. A master's
-rows travel master → master → child, and the child's write authority must still be
-evaluated against the master that wrote them. See
+and in `row` mode, the values follow the digest:
+
+```jsonc
+{ "session_id": "…", "tbl": "device", "mode": "row",
+  "origin": { "node_id": "…", "role": "child", "site": "eu-west" },
+  "rows": [ [ "<base64 key>", "<base64 digest>",
+              [ "…", 1735689600000000, { "$b": "…" } ] ], … ] }
+```
+
+The values are positional, in the projection's order for that table — see
+§ "Message encoding". The origin is **the node that wrote the rows**, not the node
+sending them. A master's rows travel master → master → child, and the child's write
+authority must still be evaluated against the master that wrote them. See
 [data-model.md](data-model.md) § "Write authority".
 
 The cursor in a request is the same shape as the `next_cursor` a response returns. It
@@ -679,7 +787,7 @@ stable string; the numeric value is an implementation detail.
 | `IDENTITY_MISMATCH` | The claimed UUID is not the identity the transport authenticated | A peer claiming another node's UUID |
 | `BAD_CREDENTIAL` | The credential does not verify for the claimed role | Wrong secret, or a rotated one |
 | `STALE_PEER` | The peer is older than the staleness horizon | The peer has been offline longer than the retention window and must re-seed; the session is pull-only in both directions |
-| `PURGE_SCHEDULE_MISMATCH` | The purge schedule differs — `purge_period_us` or `purge_offset_us` | The deployment was provisioned inconsistently; the peers would purge different sets |
+| `PURGE_SCHEDULE_MISMATCH` | The purge schedule differs — `retention_us`, `purge_period_us` or `purge_offset_us` | The deployment was provisioned inconsistently; the peers would purge different sets |
 
 Every one of these is a **correctness** failure, not a policy difference: continuing
 would mean comparing trees that cannot be compared, or accepting writes from a node that
@@ -720,6 +828,9 @@ horizon produces `STALE_PEER`.
 - [lifecycle.md](lifecycle.md) — the staleness rule and the purge handshake
 - [data-model.md](data-model.md) — merge policies, write authority and visibility profiles
 - [security.md](security.md) — handshake validation as part of the trust model
+- [architecture.md](architecture.md) — which crate owns which part of this protocol
 - [adr/0009](adr/0009-progress-has-no-eta.md) ·
   [adr/0015](adr/0015-per-table-merge-policies-and-write-authority.md) ·
-  [adr/0018](adr/0018-bounded-messages-paged-transfer-and-durable-client-sessions.md)
+  [adr/0018](adr/0018-bounded-messages-paged-transfer-and-durable-client-sessions.md) ·
+  [adr/0023](adr/0023-json-wire-format-and-transport-compression.md) ·
+  [adr/0024](adr/0024-the-workspace-is-split-into-six-crates.md)

@@ -4,7 +4,7 @@
 - **Date:** 2026-11
 - **Deciders:** project maintainers
 
-- **Supersedes:** [ADR-0013](0013-site-registry-and-range-allocation.md)
+- **Partially supersedes:** [ADR-0013](0013-site-registry-and-range-allocation.md)
 
 ## Context
 

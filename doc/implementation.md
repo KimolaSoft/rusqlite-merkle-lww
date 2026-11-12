@@ -38,7 +38,7 @@ for it.
 ### 1. Build the config
 
 ```rust
-use merkle_lww_core::SyncConfig;
+use merkle_lww_model::SyncConfig;
 
 let config = SyncConfig {
     node_id:  issued_uuid,            // issued by a master, not generated here
@@ -82,15 +82,20 @@ let spec = TableSpec {
         key_columns: vec!["userid".into()],
     },
     columns: vec![
-        ColumnSpec { name: "userid".into(),  replicated: true, visibility: Visibility::Public,
+        ColumnSpec { name: "userid".into(),  r#type: ColumnType::Text,
+                     replicated: true, visibility: Visibility::Public,
                      local: false, merge: MergeMode::LastWriteWins },
-        ColumnSpec { name: "site".into(),    replicated: true, visibility: Visibility::Public,
+        ColumnSpec { name: "site".into(),    r#type: ColumnType::Text,
+                     replicated: true, visibility: Visibility::Public,
                      local: false, merge: MergeMode::LastWriteWins },
-        ColumnSpec { name: "username".into(),replicated: true, visibility: Visibility::Public,
+        ColumnSpec { name: "username".into(),r#type: ColumnType::Text,
+                     replicated: true, visibility: Visibility::Public,
                      local: false, merge: MergeMode::LastWriteWins },
-        ColumnSpec { name: "email".into(),   replicated: true, visibility: Visibility::Public,
+        ColumnSpec { name: "email".into(),   r#type: ColumnType::Text,
+                     replicated: true, visibility: Visibility::Public,
                      local: false, merge: MergeMode::LastWriteWins },
-        ColumnSpec { name: "secret".into(),  replicated: true, visibility: Visibility::Restricted,
+        ColumnSpec { name: "secret".into(),  r#type: ColumnType::Blob,
+                     replicated: true, visibility: Visibility::Restricted,
                      local: false, merge: MergeMode::LastWriteWins },
     ],
     merge: MergePolicy::LastWriteWins,
@@ -279,8 +284,15 @@ directly:
 
 ```rust
 // The application owns the transport; the crate owns the exchange.
+//
+// The core is synchronous, so the database work is moved off the reactor thread.
 async fn handle(req: SyncRequest) -> SyncResponse {
-    let report = db.perform_exchange(peer, transport).await?;
+    let peer = req.peer();
+    let transport = req.transport();
+    let report = tokio::task::spawn_blocking(move || {
+        db.perform_exchange(peer, transport)
+    })
+    .await??;
     SyncResponse::from(report)
 }
 ```
@@ -431,7 +443,7 @@ mounted secret, or a KMS — and rotate them by rotating the configuration.
 Rotation of the digest seed is the expensive one: it re-digests every row, so it is a full
 rebuild of every tree. The role strings rotate cheaply.
 
-### Do not expect a JSON array column to merge as a set
+### How a JSON array column merges
 
 A column holding a JSON array is merged as a **value** under last-write-wins, so two sites
 editing the same array concurrently lose one side's change:

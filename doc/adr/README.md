@@ -35,6 +35,8 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | [0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | The application's authenticated identity binds to the claimed node id; per-node credentials and attribution are optional | accepted |
 | [0021](0021-re-seed-is-a-wipe.md) | A re-seed is a wipe; a stale peer pulls and never pushes | accepted |
 | [0022](0022-one-purge-instant-per-window.md) | One purge instant per window, and a deployment-wide purge offset | accepted |
+| [0023](0023-json-wire-format-and-transport-compression.md) | JSON is the wire format; compression is a transport concern | accepted |
+| [0024](0024-the-workspace-is-split-into-six-crates.md) | The workspace is split into six crates | accepted |
 
 ## Status values
 
@@ -44,15 +46,21 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | **accepted** | In force |
 | **superseded by ADR-NNNN** | Replaced; the replacement is named |
 | **partially superseded by ADR-NNNN** | Replaced in part; the named record replaces the superseded part, and the rest of the record stands |
+| **extended by ADR-NNNN** | Not replaced, but the named record adds to it — the original decision stands and the extension is a refinement of it |
 | **deprecated** | No longer relevant, but not replaced |
 
 A record that replaces another carries a back-reference in its header, so the
 replacement can be found from either end:
 
 ```
-- **Supersedes:** [ADR-NNNN](...)
-- **Partially supersedes:** [ADR-NNNN](...)
+- **Supersedes:** ADR-NNNN
+- **Partially supersedes:** ADR-NNNN
 ```
+
+Both forms are used as links in the records themselves. They may also name a
+**document section**, when what was replaced is a statement in the design rather than a
+prior decision — a wire-format note in the protocol document, or a crate layout in the
+architecture document.
 
 ## Adding one
 

@@ -321,6 +321,16 @@ pub enum Visibility {
 
 pub struct ColumnSpec {
     pub name: String,
+
+    /// The column's declared type. One of `null`, `integer`, `real`, `text`, `blob`.
+    ///
+    /// SQLite is dynamically typed, so a column's *declared* type is its **affinity**,
+    /// not a guarantee about the value stored in it — a `text` column can hold an
+    /// integer. The declared type is what the wire carries so that a receiver can
+    /// decode the row's positional values, and it is part of `schema_hash`, because
+    /// the digest's input depends on the storage class of each value.
+    pub r#type: ColumnType,
+
     pub replicated: bool,       // participates in sync and in the digest at all
     pub visibility: Visibility,
 
@@ -332,6 +342,14 @@ pub struct ColumnSpec {
     /// The column holds a set (a JSON array), and concurrent edits should merge as a
     /// set rather than replace the whole value.
     pub merge: MergeMode,
+}
+
+pub enum ColumnType {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
 }
 
 pub enum MergeMode {
@@ -574,7 +592,8 @@ necessarily narrower — to fail the digest check.
 
 A **client** session does not compare either hash. The client names its profile in the
 handshake, the server resolves it to a **projection** (the table → column list the
-profile resolves to) and sends it, and the client applies that projection. A client that
+profile resolves to, with each column's type) and sends it, and the client applies that
+projection. A client that
 does not know the profile definition gets the projection as it arrives; a client that
 does know it can compare the projection against its own expectation and log a warning on
 a difference. It never fails the session — see
@@ -693,7 +712,8 @@ or site-namespaced keys. It would become a full decode of every row at startup.
 `purge_on_us` is the same idea for the tombstone deadline: it is `NULL` while the row
 is live, and it makes "which tables have tombstones due at instant T" an indexed
 existence query instead of a scan. Because `purge_on` is uniform per window, the purge
-is an equality predicate on it. See [protocol.md](protocol.md) § "The purge quiesce
+is a single predicate on it — `purge_on <= T`, which is an equality in steady state and
+catches a backlog otherwise. See [protocol.md](protocol.md) § "The purge quiesce
 window".
 
 ```sql

@@ -4,7 +4,8 @@ Last-write-wins replication for SQLite, with a time-bucketed Merkle tree used to
 the minimal set of differences between peers.
 
 > **Status: design phase.** No implementation code exists yet. The documentation in
-> [`doc/`](doc/) specifies the system; [`PLAN.md`](PLAN.md) sequences the work.
+> [`doc/`](doc/) specifies the system; [`PLAN.md`](PLAN.md) sequences the work, one plan
+> per crate.
 
 ## What it is
 
@@ -42,7 +43,17 @@ without transferring rows that did not.
 
 ## Build status
 
-There is nothing to build yet. The plan is in [`PLAN.md`](PLAN.md).
+There is nothing to build yet. The plan is in [`PLAN.md`](PLAN.md), which indexes one
+plan per crate:
+
+| Plan | Crate |
+|---|---|
+| [`plan/model.md`](plan/model.md) | `merkle-lww-model` — the vocabulary: config, codec, digest, hashes, merge rules |
+| [`plan/protocol.md`](plan/protocol.md) | `merkle-lww-protocol` — the wire contract: messages, JSON shapes, handshake rules |
+| [`plan/core.md`](plan/core.md) | `merkle-lww-core` — the engine over SQLite: store, tree, diff, session, lifecycle |
+| [`plan/axum.md`](plan/axum.md) | `merkle-lww-axum` — the transport: REST, WebSocket, progress, compression |
+| [`plan/cli.md`](plan/cli.md) | `merkle-lww-cli` — the binary: `serve`, `pull`, `push`, `inspect`, `tree`, `verify` |
+| [`plan/demo.md`](plan/demo.md) | `merkle-lww-demo` — the conformance harness: in-memory transport, scripted clock, fixtures |
 
 ## Licence
 

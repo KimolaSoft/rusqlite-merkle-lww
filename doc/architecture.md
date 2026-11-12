@@ -150,11 +150,12 @@ authentication.
 
 | Layer | Provided by | Notes |
 |---|---|---|
-| The exchange logic | the crate | diff, merge, LWW, progress |
-| A message type | the crate | serialisable, transport-independent |
-| The wire format | the crate | JSON, or binary behind a feature |
-| REST endpoints | the crate, optionally | `merkle-lww-axum` |
-| WebSocket handling | the crate, optionally | `merkle-lww-axum` |
+| The vocabulary — config, digest, hashes, merge rules | `merkle-lww-model` | pure; `serde` only |
+| A message type | `merkle-lww-protocol` | serialisable, transport-independent |
+| The wire format | `merkle-lww-protocol` | JSON, `merkle-lww/1` |
+| The exchange logic | `merkle-lww-core` | diff, merge, LWW, progress |
+| REST endpoints | `merkle-lww-axum`, optionally | |
+| WebSocket handling | `merkle-lww-axum`, optionally | |
 | TLS | **the application** | usually terminated by a proxy or ingress |
 | Authentication | **the application** | the crate checks the credential it is given |
 | Routing, middleware, session management | **the application** | |
@@ -181,31 +182,120 @@ The guidance for implementers is in
 └───────────────────────────┬─────────────────────────────────┘
                             │ rusqlite::Connection
 ┌───────────────────────────▼─────────────────────────────────┐
-│  merkle-lww-core                                            │
-│                                                             │
+│  merkle-lww-core            the engine                       │
 │   store ──────── managed tables, _sync_log, triggers         │
-│   codec ─────── canonical encoding, digest                  │
 │   merkle ────── bucket tree, snapshot                       │
 │   diff ──────── comparison, merge                            │
-│   sync ──────── session state machine                       │
-│   time ──────── timestamps, monotonic issuance               │
+│   session ───── session state machine                       │
+│   lifecycle ─── purge schedule, quiesce, staleness           │
 └───────────────────────────┬─────────────────────────────────┘
                             │ trait boundaries
 ┌───────────────────────────▼─────────────────────────────────┐
-│  merkle-lww-axum                                            │
-│    REST handlers · WebSocket sessions · progress endpoints  │
+│  merkle-lww-axum            the transport                   │
+│    REST handlers · WebSocket sessions · progress endpoints   │
 └───────────────────────────┬─────────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────────┐
-│  merkle-lww-cli                                             │
+│  merkle-lww-cli             the binary                       │
 │    serve · pull · push · inspect · tree · verify            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
+`merkle-lww-model` and `merkle-lww-protocol` sit **under** `merkle-lww-core` in the
+graph and are not shown here: they are pure, they carry no I/O, and `core` depends on
+them rather than the other way round.
+
+```
+merkle-lww-model        the vocabulary
+  codec · config · merge · visibility · schema · time · error
+merkle-lww-protocol     the wire contract
+  messages · values · handshake · engine · transport · version
+```
+
+See § "The crate graph".
+
+## The crate graph
+
+The workspace has six crates, and the dependency edges point one way. The split is on
+two independent axes — **what needs SQLite** and **what needs a runtime** — not on
+"database versus transport" alone.
+
+```
+merkle-lww-model      config · merge · visibility · codec · schema · time · error
+      ▲
+merkle-lww-protocol   messages · values · handshake · engine · transport · version
+      ▲
+merkle-lww-core       store · trigger · authorizer · log · merkle · diff · bulk ·
+      ▲               cache · session · paging · lifecycle · directory · registry ·
+      ▲               allocator · session_store
+merkle-lww-axum       REST · WebSocket · progress · compression
+      ▲
+merkle-lww-cli        serve · pull · push · inspect · tree · verify
+
+merkle-lww-demo       in-memory transport · scripted clock · two-node fixture ·
+                      topology and scenario fixtures  (depends on core, protocol, model)
+```
+
+See [ADR-0024](adr/0024-the-workspace-is-split-into-six-crates.md).
+
+### `merkle-lww-model`
+
+The vocabulary. Pure — `serde` and nothing else, no SQLite and no runtime.
+
+It holds what must mean the same thing everywhere: the canonical encoding and the
+seeded xxh3 digest, the `schema_hash`, the `visibility_hash`, the merge decision
+rules, the configuration types, the timestamp rules, and the error codes.
+
+Two things follow from it being pure, and both are why it is its own crate:
+
+- **The compatibility surface is testable without a database.** The digest rules, the
+  schema hash and the visibility hash are exactly what two independently implemented
+  peers must agree on byte for byte. Golden vectors for them are consumable by an
+  implementation in another language, which is the point of specifying the encoding
+  precisely.
+- **The extension point carries no engine weight.** `MergePolicyFn` is what an
+  application implements, and it is a pure function of `(incoming, local) ->
+  MergeDecision`. Under a single-crate layout, implementing one meant depending on
+  `rusqlite` and the whole engine.
+
+### `merkle-lww-protocol`
+
+The wire contract. The message types, their JSON shapes, the wire version
+`merkle-lww/1`, and the **handshake validation rules**.
+
+The rules are pure functions over a gathered view:
+
+```rust
+pub fn validate_handshake(local: &LocalView, peer: &Hello) -> Result<Hello>;
+```
+
+`LocalView` is the set of facts the rules check — the epoch, the codec version, the two
+hashes, the retention and purge schedule, the known peers, the last sync instant.
+`core` gathers it from the database; the rules themselves need no database, so every
+rejection case is a table-driven test with no fixture.
+
+This crate also declares **the traits the session needs from the engine**, which `core`
+implements. The consumer declaring the interface is what keeps the dependency edge
+pointing one way.
+
+It also declares **the `Transport` trait** — the seam the application implements to
+carry messages. The trait is in terms of *messages*, not bytes, which is what keeps
+compression outside the protocol: a transport that compresses is compressing the bytes
+it puts on the wire, and the crate never sees them.
+
+The wire version and the codec version are separate, and this is where that separation
+lives: `merkle-lww/1` versions the protocol, `codec_version` versions the canonical
+encoding. Changing the wire format re-digests nothing.
+
 ### `merkle-lww-core`
 
-Transport- and runtime-agnostic. No tokio, no axum. It is a library over `rusqlite`, and
-it can be driven from a blocking binary or a test harness.
+The engine. Everything that touches SQLite. It depends on `rusqlite` and `r2d2`, and
+it stays **synchronous**: no `tokio`, no `axum`.
+
+It is **one** crate, not several. The store, the triggers, the authorizer, the log, the
+tree, the diff, the bulk path and the session all take `Db` in nearly every signature;
+splitting them produces crates that cannot be used independently, so the boundary cost
+is paid and none of the benefit is received.
 
 The central abstraction is `Db`:
 
@@ -242,8 +332,12 @@ the connection it already owns.
 
 ### `merkle-lww-axum`
 
-The transport. Depends on `core`. Provides the REST endpoints and the WebSocket session
-handling described in [protocol.md](protocol.md).
+The transport. Depends on `core` and `protocol`. Provides the REST endpoints and the
+WebSocket session handling described in [protocol.md](protocol.md).
+
+This is where the async boundary is, and where `tokio` lives. It also owns
+**compression**: zstd level 1 by default, which the application may disable. See
+[ADR-0023](adr/0023-json-wire-format-and-transport-compression.md).
 
 The crate does **not** terminate TLS. See [security.md](security.md).
 
@@ -253,26 +347,67 @@ Operational tooling. The `inspect`, `tree` and `verify` subcommands are not opti
 extras — Merkle bugs are undebuggable without them. See
 [operations.md](operations.md).
 
+### `merkle-lww-demo`
+
+The conformance harness. It exists to answer one question: **how do we know the
+interface is right?**
+
+- **An in-memory `Transport`**, so a full session runs between two peers in one
+  process with no ports and no network.
+- **A scripted clock**, so purge instants, the quiesce window and the staleness horizon
+  are reached by advancing time rather than by sleeping. The failure modes — a missed
+  purge instant, a stale peer, a quiescing table, a resumed cursor — are the ones that
+  are otherwise flaky.
+- **A two-node fixture**: two `Db`s over in-memory SQLite, exchanged through the
+  in-memory transport. This is what the convergence suite drives.
+- **The topology and scenario fixtures**: the multi-node topologies for the convergence
+  test, and the named lifecycle scenarios. The **wire vectors** themselves are published
+  by `merkle-lww-protocol`, because the protocol crate is what defines the wire; this
+  crate asserts against them, so a change to a message shape fails here as well as
+  there.
+
+It is a crate rather than a directory of tests so the examples are **compiled and run**
+by CI. A worked example that is not executed is documentation that has already drifted.
+
 ## Crate layout
 
 ```
 rusqlite-merkle-lww/
 ├── Cargo.toml                 # workspace
-├── PLAN.md                    # implementation plan
+├── PLAN.md                    # the index: open questions, risks, cross-cutting work
+├── plan/                      # one plan per crate
+│   ├── model.md
+│   ├── protocol.md
+│   ├── core.md
+│   ├── axum.md
+│   ├── cli.md
+│   └── demo.md
 ├── README.md
 ├── doc/                       # these documents
 │   └── adr/
 ├── crates/
-│   ├── merkle-lww-core/
+│   ├── merkle-lww-model/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── config.rs      # SyncConfig, TableSpec, Peer, CacheConfig
-│   │       ├── visibility.rs  # VisibilityProfile, projections, visibility_hash
 │   │       ├── merge.rs       # MergePolicy, MergePolicyFn, WriteAuthority
+│   │       ├── visibility.rs  # VisibilityProfile, projections, visibility_hash
 │   │       ├── codec.rs       # canonical encoding, digest, seeded xxh3
 │   │       ├── schema.rs      # schema_hash
 │   │       ├── time.rs        # RFC 3339, monotonic issuance
-│   │       ├── error.rs       # the error type and the protocol error codes
+│   │       └── error.rs       # the error type, including the error codes
+│   ├── merkle-lww-protocol/
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── messages.rs    # Hello, Summary, Detail, Rows, Commit, Progress
+│   │       ├── values.rs      # the tagged wire value form
+│   │       ├── handshake.rs   # LocalView, validate_handshake
+│   │       ├── engine.rs      # the traits the session needs from the engine
+│   │       ├── transport.rs   # the Transport trait the application implements
+│   │       └── version.rs     # the wire version: merkle-lww/1
+│   ├── merkle-lww-core/
+│   │   └── src/
+│   │       ├── lib.rs
 │   │       ├── store.rs       # Db, pool, managed tables, DDL
 │   │       ├── trigger.rs     # trigger installation, both dialects
 │   │       ├── authorizer.rs  # sqlite3_set_authorizer rules
@@ -286,16 +421,25 @@ rusqlite-merkle-lww/
 │   │       ├── bulk.rs        # bulk apply, chunking, the parameter limit
 │   │       ├── paging.rs      # page cursors and the byte budget
 │   │       ├── session.rs     # protocol state machine
+│   │       ├── lifecycle.rs   # the purge schedule, quiesce, staleness, re-seed
 │   │       └── cache.rs       # read-through cache
 │   ├── merkle-lww-axum/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── rest.rs
 │   │       ├── ws.rs
-│   │       └── progress.rs
-│   └── merkle-lww-cli/
+│   │       ├── progress.rs
+│   │       └── compression.rs  # the zstd content encoding
+│   ├── merkle-lww-cli/
+│   │   └── src/
+│   │       └── main.rs
+│   └── merkle-lww-demo/
 │       └── src/
-│           └── main.rs
+│           ├── lib.rs
+│           ├── transport.rs    # the in-memory Transport
+│           ├── clock.rs        # the scripted clock
+│           ├── fixture.rs      # the two-node fixture
+│           └── vectors.rs      # the topology and scenario fixtures
 ```
 
 The optional pieces — the registry, the allocator and the `site` column — live behind
@@ -316,6 +460,12 @@ the `alloc` feature and are not dependencies of the sync core. See
   its result is published into an `arc-swap` snapshot.
 - **Synchronous core.** `merkle-lww-core` is synchronous. The async boundary is the
   transport, which is where `tokio` lives.
+- **Pure below the core.** `merkle-lww-model` and `merkle-lww-protocol` have no
+  concurrency at all — no `Send` bounds, no interior mutability, no locks. The
+  handshake rules in `protocol` are ordinary functions over ordinary data.
+- **The demo runs in one thread.** The in-memory transport and the scripted clock are
+  single-threaded by construction, so a test that drives two peers is deterministic
+  rather than merely fast.
 
 ### The snapshot
 

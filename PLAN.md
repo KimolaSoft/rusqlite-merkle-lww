@@ -1,516 +1,85 @@
 # Implementation plan
 
-How this gets built, in what order, and how each phase is judged complete.
+The work is split **by crate**, not by phase. There is one plan per crate, and each
+one is narrow enough that the whole of it can be held in mind at once — which is the
+point, because the phases ran long and the focus drifted.
+
+| Plan | Crate | Depends on |
+|---|---|---|
+| [model.md](plan/model.md) | `merkle-lww-model` | `serde` |
+| [protocol.md](plan/protocol.md) | `merkle-lww-protocol` | `model` |
+| [core.md](plan/core.md) | `merkle-lww-core` | `model`, `protocol`, `rusqlite` |
+| [axum.md](plan/axum.md) | `merkle-lww-axum` | `core`, `protocol`, `model`, `tokio` |
+| [cli.md](plan/cli.md) | `merkle-lww-cli` | `axum`, `core` |
+| [demo.md](plan/demo.md) | `merkle-lww-demo` | `core`, `protocol`, `model` |
+
+This file holds what does not belong to any one crate: the dependency order, the
+cross-cutting work, the open questions and the risks.
+
+See [ADR-0024](doc/adr/0024-the-workspace-is-split-into-six-crates.md) for why the
+workspace is split this way, and
+[ADR-0023](doc/adr/0023-json-wire-format-and-transport-compression.md) for the wire
+format.
 
 ## Principles
 
-- **Each phase ends with something that works.** No phase is "set up for later".
-- **The engine is testable without the transport.** The sync engine must not depend on
-  axum, so the convergence test can drive several nodes in one process.
-- **The enforcement layer comes before the sync layer.** Getting the SQLite mechanics
-  right is the highest-risk part of the design, and it is independently verifiable.
-- **A phase is not done until its test suite passes**, not when the code compiles.
+- **Enforce in SQLite, not in the API.** The invariants live in the database, so a
+  write that bypasses the crate's API still cannot break them.
+  ([ADR-0002](doc/adr/0002-enforce-in-sqlite-not-in-the-api.md))
+- **The crate owns the exchange; the application owns the transport.**
+  ([ADR-0011](doc/adr/0011-crate-provides-the-exchange.md))
+- **The digest is always computed and keyed.**
+  ([ADR-0004](doc/adr/0004-digest-is-always-computed-and-keyed.md))
+- **Bucket boundaries are absolute and epoch-anchored.**
+  ([ADR-0003](doc/adr/0003-absolute-bucket-boundaries.md))
+- **An ADR that turns out to be wrong is superseded, not edited.**
 
 ## Dependencies
 
+The dependency edges point one way, and the build order follows them:
+
 ```
-Phase 0 ── Foundations
-   │
-Phase 1 ── Store and enforcement
-   │
-Phase 2 ── Merkle tree
-   │
-Phase 3 ── Diff engine
-   │
-   ├── Phase 4 ── Transport
-   │
-   └── Phase 5 ── Lifecycle
-           │
-Phase 6 ── Hardening (after 4 and 5)
+model ──► protocol ──► core ──► axum ──► cli
+                    │         │
+                    └─────────┴──────► demo
 ```
 
-Phases 4 and 5 can proceed in parallel once Phase 3 lands, and Phase 6 follows both.
-
----
-
-## Phase 0 — Foundations
-
-**Goal.** The crate skeleton, the types everything else depends on, and the canonical
-encoding.
-
-### Deliverables
-
-- Workspace with three crates: `merkle-lww-core`, `merkle-lww-axum`, `merkle-lww-cli`.
-- `config.rs`: `SyncConfig`, `TableSpec`, `ColumnSpec`, `KeyStrategy`, `Visibility`,
-  `TableKind`, `MergeMode`, `MergePolicy`, `WriteAuthority`, `Peer`, `PeerAuth`,
-  `CacheConfig`, `Role`, `WriteMode`, `AllocationSpec`. All `serde`-derived with
-  `Default`.
-- `merge.rs`: `MergePolicy`, `MergePolicyFn`, `MergeContext`, `MergeDecision` — the
-  extension points and the rules they must obey.
-- `visibility.rs`: `VisibilityProfile`, `ProfileTable`, the projection resolver, and
-  the `visibility_hash`.
-- `codec.rs`: the canonical encoding — one tagged-value rule for both keys and values;
-  the seeded xxh3 digest; the two-level `row_hash`; the codec version.
-- `schema.rs`: the `schema_hash` — exactly the inputs to the row digest, including the
-  registered column order.
-- `time.rs`: RFC 3339 parsing and formatting at fixed six-digit precision; the
-  monotonic issuance guard.
-- `error.rs`: the error type, including the protocol error codes.
-- `SecretString`: a wrapper whose `Debug` does not print its contents.
-
-**The crate persists no secret material.** The digest seed, the role strings and the peer
-list are configuration, held in memory for the life of the process. Nothing secret is
-written to the database, and the crate implements no rotation.
-
-### Notes
-
-- The digest is implemented here, not in the store, because it depends only on the
-  canonical encoding.
-- The monotonic guard is a small type here (`TimestampIssuer`) holding an `AtomicI64`,
-  with the persisted value loaded at startup and written back on change.
-- The canonical encoding is the one thing that must not change once data exists. Get it
-  right now.
-- **`KeyStrategy::GlobalId` uses the application's own column** when it is already globally
-  unique and stable, so no extra column is added. `Derived` covers the applications that
-  cannot offer one.
-- **Local columns are excluded from the digest**, not merely from the merge. Including
-  them would make two peers holding the same entity compute different digests, so every
-  bucket would differ and nothing would ever converge.
-- **The registered column order is part of the schema hash.** The digest concatenates
-  values in registration order, so a different order is a different digest for the same
-  logical row — permanent, silent divergence. The order is not an implementation detail.
-- **The digest is 16 bytes, big-endian on the wire, compared as a `u128`.** Comparing raw
-  bytes in memory order would let two peers disagree on an exact-timestamp tie.
-- **The digest's input is the full replicated column set**, never the columns a
-  particular peer may see. Visibility decides what is sent, not what is hashed; a peer
-  that cannot see a column receives the digest verbatim and never recomputes it. The tree
-  is unaffected, because `row_hash` is a function of the digest and not of the payload.
-- **The digest seed is a third value**, separate from the two credential strings and
-  rotated independently. Deriving it from a credential would couple a routine credential
-  rotation to a full dataset rebuild.
-- **The visibility profiles are deployment-wide state too**, and a divergence is fatal
-  between trusted peers. `visibility_hash` is separate from `schema_hash`, because a
-  client's registration is necessarily narrower and could never match the full schema
-  hash.
-- **A custom merge policy must be pure and convergent.** The crate cannot check it, so
-  it is a stated requirement on the application; a policy that returns `Undecided` falls
-  through to the digest tie-break. See
-  [ADR-0015](doc/adr/0015-per-table-merge-policies-and-write-authority.md).
-
-### Exit criteria
-
-- The workspace builds; `cargo clippy` is clean.
-- Canonical encoding golden vectors pass, and are published as a fixture.
-- The encoding is injective on a generated set of values: two distinct rows never encode
-  to the same bytes (`proptest`).
-- Timestamps round-trip through parse and format at fixed six-digit precision, and sort
-  lexicographically in chronological order.
-- **The derived sync id is deterministic**: the same identity columns produce the same
-  id on every node, and different identity columns produce different ids.
-- **The key encoding is the value encoding**: `userid = 10001` produces the same tagged
-  bytes in `_sync_log.k`, in the digest input, and on the wire — and the same rule covers
-  a composite key.
-- **The schema hash covers exactly the digest's inputs**: two nodes differing only in
-  registered column order are rejected at handshake, not discovered as divergence.
-- **The visibility hash covers exactly the profile definitions**, and is separate from
-  the schema hash: a client with a narrower registration still matches a master's
-  projection.
-- **A peer with a narrower profile agrees with a peer with a wider one** on the digest
-  of the same row, and its tree matches: the digest is received verbatim, and the tree
-  is a function of the digest rather than of the payload.
-
-**Test suites:** 14 (canonical encoding), plus the schema-hash and visibility-hash
-checks.
-
----
-
-## Phase 1 — Store and enforcement
-
-**Goal.** The local database: managed tables, the trigger set, the authorizer rules, the
-internal log, and DDL management.
-
-This is the highest-risk phase, because it depends on subtle SQLite behaviour that was
-verified experimentally rather than documented (see
-[doc/sqlite-interface.md](doc/sqlite-interface.md) § "Verified SQLite behaviour").
-
-### Deliverables
-
-- `store.rs`: the `Db` type, the `r2d2` pool, the connection factory that registers
-  UDFs and installs the authorizer, and `Db::conn()` / `Db::transaction()`.
-- `Db::register_on(&rusqlite::Connection)`: install the UDFs and the authorizer on a
-  **caller-owned** connection, so an application with an existing write path does not
-  have to move its writes into the crate's pool. `Db::with_privilege(conn, f)` grants
-  crate privilege on that connection for the crate's own writes.
-- `trigger.rs`: trigger installation for both dialects; the managed column DDL.
-- `authorizer.rs`: the denial rules, the `accessor` exemption, and the per-connection
-  privilege flag.
-- `log.rs`: `_sync_log` reads and writes. The log carries `last_update_us` (the row's
-  `last_update` as integer microseconds) and `purge_on_us` (NULL while the row is live).
-- `registry.rs`: the site registry — the replicated `sites` table, its immutable-range and
-  no-overlap triggers, the per-row range-enforcement trigger, and the `site` column
-  default. **Only when the `alloc` feature is enabled and a table declares an
-  `AllocationSpec`.**
-- `allocator.rs`: the globally-unique id allocator — per-site ranges and a durable
-  monotonic counter. **Behind the optional `alloc` feature**; the sync core does not
-  depend on it.
-- `session_store.rs`: the `_sync_session` table — a client's durable session journal,
-  and the `_sync_page` table it stages received pages in.
-- DDL management: `create_table`, `alter_table`, `adopt_table`, `drop_table`.
-- The UDFs: `sync_stamp()`, `sync_us(text)`, `sync_digest(...)`, and — on tables with
-  allocated identifiers — `local_site()`.
-
-### Notes
-
-- **The privilege flag is per-connection.** It cannot live on `Db`, because another
-  thread may hold a different connection from the same pool.
-- **Every pooled connection gets the UDFs and the authorizer.** A connection that
-  escapes uninstrumented is a hole, so the connection factory is the only way to make
-  one.
-- **A caller-owned connection is instrumented by `register_on`.** The UDFs close over
-  the node's shared `TimestampIssuer`, so a timestamp issued on a caller-owned
-  connection is strictly greater than the last one issued anywhere in the process — the
-  monotonic guard holds across both kinds of connection. An unregistered connection
-  still fails closed.
-- **Every DDL path reinstalls the triggers** and rebuilds the tree.
-- The compatible dialect's staging table and drainer are implemented here, since they
-  are part of the write path.
-- **The registry lives in the main database.** SQLite forbids a trigger from referencing
-  an object in an attached database, so a separate `sites.db` is not an option while the
-  range check is a trigger.
-- **The `site` column defaults to `local_site()`**, so the application never writes it.
-  `ALTER TABLE … ADD COLUMN` rejects a non-constant default, so the `DEFAULT (fn())` form
-  needs `CREATE TABLE`; for an existing table the crate installs an `AFTER INSERT`
-  backfill trigger and backfills the rows.
-- **The range trigger fires only when the registry knows the row's owner.** A site
-  created mid-session may have its rows arrive before the registry row does; rejecting
-  them would deadlock the conversation.
-- **The `_sync_log` timestamp is the row's `last_update`, not a second clock.** The
-  trigger writes both from one value, so they cannot disagree. The log needs it as an
-  integer for bucketing and range scans, and it never reads a payload column.
-- **`purge_on_us` is NULL while a row is live**, which makes "which tables have
-  tombstones due at instant T" an indexed existence query.
-- **The allocator guarantees "never reused".** Allocation is durable and happens
-  *before* use: a gap is harmless, a reuse is corruption. The counter must not roll back
-  with a transaction, so it is advanced outside the insert's transaction.
-- **The allocator is optional.** A deployment that brings its own identifier scheme
-  declares no `AllocationSpec`, and then there is no registry, no `site` column, no
-  range trigger and no REGISTRY phase. The allocator lives behind the `alloc` feature,
-  and the sync core does not depend on it. See
-  [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md).
-- **The registry's range is immutable.** A site is renamed; its range is not moved. A
-  decommissioned site's range is retired forever, like a retired identifier.
-- **A row names the site that owns its identifier, not the site that last wrote it.** The
-  `site` column is replicated and in the digest; the range check is keyed on it, so a
-  peer's rows are accepted on the same terms as local ones.
-- **The range check fires only when the registry knows the owner.** A site created
-  mid-session may have its rows arrive before the registry row does; rejecting them would
-  deadlock the conversation, so they are accepted provisionally and re-validated later.
-- **The registry is exchanged before the data** in every session — when it is in use —
-  and is part of the join bundle alongside the epoch and the digest seed.
-
-### Exit criteria
-
-- Suite 2 (engine enforcement) passes in full, using raw SQL.
-- Suite 3 (trigger mechanics) passes: one log row and one stamp per update, no
-  recursion, identical behaviour with `recursive_triggers` on and off.
-- Suite 13 (DDL) passes.
-- Suite 18 (site registry and allocation) passes.
-- The SQLite behaviour assertions are preserved as tests, so a SQLite upgrade that
-  changes the semantics the design relies on fails loudly.
-- A raw `INSERT` on a managed table from an instrumented connection results in a
-  stamped row and a correct `_sync_log` entry, verified by inspecting the database
-  directly rather than through the crate's API.
-- **The allocator never reissues an identifier**: after a crash and restart, the next
-  allocated id is strictly greater than every previously allocated one.
-- **The registry enforces its invariants**: an overlapping range is refused on insert, a
-  range change is refused on update, and a descriptive update is accepted.
-- **The range check rejects a bad mint, accepts a peer's rows, and defers an unknown
-  owner** — including on the `ON CONFLICT DO UPDATE` path.
-- **The `site` column is filled by the engine**: an insert that omits it gets the local
-  site, an explicit value wins, and a connection without the UDF fails closed.
-- **The crate builds without the `alloc` feature**, and a deployment with no
-  `AllocationSpec` has no registry, no `site` column and no range trigger.
-- **A caller-owned connection behaves like a pooled one**: after `register_on`, a write
-  is stamped and logged, and the authorizer denies the same operations.
-- **The monotonic guard holds across connection kinds**: a timestamp issued on a
-  caller-owned connection is greater than the last one issued on a pooled one.
-
-**Test suites:** 2, 3, 13, 18.
-
----
-
-## Phase 2 — Merkle tree
-
-**Goal.** The bucket tree: definitions, hashing, the snapshot, and maintenance.
-
-### Deliverables
-
-- `merkle.rs`: bucket id computation from the epoch; the three hash levels; the
-  `SyncSnapshot`; the `ArcSwap` publication.
-- Rebuild from `_sync_log` at startup.
-- Incremental maintenance: apply a row change, apply a purge.
-- The `max_tree_buckets` tripwire.
-
-### Notes
-
-- The hour hash is a commutative sum, so a row move is two O(1) updates. The cycle and
-  month hashes are ordered folds over 24 and 30 children, recomputed on change.
-- Publication is coalesced. A burst of writes must not produce a burst of snapshots.
-- The rebuild is one indexed pass over `_sync_log`; it must not read payload columns.
-
-### Exit criteria
-
-- The tree unit tests pass: bucket assignment is a pure function of `last_update`; the
-  same timestamp always lands in the same bucket.
-- **The incremental hash matches a full rebuild**, always (`proptest` over random write
-  sequences). Drift here would be invisible until it caused permanent divergence.
-- Rebuild at startup produces the same tree as incremental maintenance from empty.
-- Memory matches the table in [doc/merkle.md](doc/merkle.md) § "Memory".
-
-**Test suites:** tree units, plus the incremental-vs-rebuild property.
-
----
-
-## Phase 3 — Diff engine
-
-**Goal.** Compare two trees, find the differing rows, and merge them.
-
-### Deliverables
-
-- `diff.rs`: the summary / detail / rows comparison logic, operating on abstract trees
-  rather than on a transport.
-- `merge.rs`: the merge rule — LWW on `(last_update, digest)`, with the digest
-  tie-break — plus the per-table merge policy hook and the write-authority check.
-- The row-level diff in both modes: `digest` (compact) and `row` (simple).
-- `session.rs`: the protocol state machine, transport-independent.
-- Canonical serialisation of rows for the wire.
-- `bulk.rs`: the bulk apply path — chunked multi-row `VALUES`, the JSON bulk path, and
-  the staging-table path. See [doc/bulk-apply.md](doc/bulk-apply.md).
-- `paging.rs`: the page cursor, the byte budget, and the resumable page sequence.
-
-### Notes
-
-- **The engine must not depend on axum.** The convergence test drives several nodes
-  in one process through an in-memory transport.
-- The merge must be idempotent: applying the same row twice is a no-op.
-- A deleted row is an ordinary row. No special case in the diff, the merge, or the
-  serialisation.
-- **Bulk apply must respect the 32,766 bound-parameter limit.** The chunk size is
-  derived from the column count, not hardcoded: `rows × columns ≤ 32,766`. A wide table
-  chunks smaller automatically. The limit cannot be raised at runtime — it is a
-  compile-time ceiling in SQLite.
-- The LWW filter is expressible in the upsert itself
-  (`ON CONFLICT … DO UPDATE … WHERE excluded.last_update > device.last_update`), but the
-  digest tie-break is applied in Rust, so the existing rows for a batch's keys are read
-  once and compared in memory before the upsert.
-- **A custom merge policy bypasses the upsert-level filter.** The decision is made in
-  Rust, and only the winners are upserted. The `WHERE` clause is the *default* policy's
-  filter, not a universal one.
-- **Batch repair runs on the sender.** A receiver-side repair changes the stored bytes
-  and therefore the digest, and the peers would never converge.
-- **Write authority is evaluated against the row's origin**, which the wire carries —
-  not against the node that forwarded the row.
-- **A page is bounded by bytes, not by rows.** The sender stops when the encoded message
-  would exceed `max_message_bytes` and returns a cursor.
-- **The cursor is deterministic**: buckets in order, rows within a bucket by canonical
-  key bytes, so both sides agree on the order without exchanging it.
-- Bulk apply and the `_sync_log` update happen in the same transaction, so the log and
-  the user table cannot diverge.
-
-### Exit criteria
-
-- Suite 1 (convergence) passes for two and for three nodes.
-- Suite 8 (tie-break) passes: two peers with an identical `last_update` and different
-  payloads converge on the same winner.
-- Suite 9 (divergence detection) passes: an out-of-band edit is detected and reported.
-- Applying a row updates the user table, `_sync_log` and the tree in one transaction.
-- **A 50,000-row batch applies without exceeding the parameter limit**, and the chunk
-  size adapts to the column count. Measured reference: ~95 ms for 50,000 rows via
-  chunked `VALUES`, ~108 ms via the JSON path.
-- A bulk apply is atomic: a failure part-way through leaves nothing applied.
-- **Suite 19 (merge policies and write authority) passes**, including convergence with
-  a custom policy in the loop.
-- **A page never exceeds `max_message_bytes`,** and a page re-issued with a cursor
-  continues exactly where the last one stopped.
-
-**Test suites:** 1, 8, 9, 16, 19.
-
----
-
-## Phase 4 — Transport
-
-**Goal.** The protocol over HTTP and WebSocket, as an optional convenience over a
-transport-agnostic core.
-
-### Deliverables
-
-- The core's transport-agnostic exchange: `perform_exchange(peer, transport)`, where
-  `transport` carries request and response messages. The session state machine must not
-  know about HTTP.
-- `merkle-lww-axum`: the REST endpoints and the WebSocket handler, built on the core.
-- `directory.rs`: the UUID directory — the local table, the handshake merge, and the
-  per-node revocation check.
-- Sessions: opaque `session_id`, in-memory, five-minute **idle** TTL. A client that
-  needs to survive a restart persists its session in `_sync_session` and re-opens it by
-  id.
-- The handshake and its validation, including the projection and the `visibility_hash`.
-- The progress model: `SyncProgress`, the endpoints, the WS frame.
-- Auth: the peer list check, the credential check, and the binding of the
-  application's authenticated identity to the claimed node id.
-- The message budget (`max_message_bytes`) and the round limit
-  (`max_rounds_per_session`).
-- `doc/implementation.md`, covering the integration for application developers.
-
-### Notes
-
-- The handshake validation is where `EPOCH_MISMATCH`, `DIGEST_SEED_MISMATCH`,
-  `UNKNOWN_PEER`, `IDENTITY_MISMATCH`, `VISIBILITY_MISMATCH`, `STALE_PEER` and
-  `COLUMN_NOT_PERMITTED` are raised.
-- **`STALE_PEER` is raised by the staleness horizon alone** — `now - last_sync_us >
-  retention`. A peer that merely missed a purge instant catches up and carries on; that
-  is not an error.
-- `as_of_us` is server-supplied in a client→server session, so both sides choose
-  identical comparison depths.
-- Progress frames are throttled to 250 ms and only sent when `completed` advances.
-- **The crate does not terminate TLS.** The application does, and handles authentication.
-  The crate's own axum crate assumes TLS is terminated in front of it. The application
-  passes the authenticated identity in as `SessionContext`, and the crate binds it to
-  the claimed node id.
-- **A session that hits the round limit ends with `SESSION_LIMIT`**, which is retryable:
-  the caller re-opens with the last cursor.
-- **Tables are synced in `sync_priority` order, newest buckets first**, so a client
-  catching up is usable before it is complete.
-- The core's transport abstraction is what lets the convergence test drive several nodes
-  in one process. It is a testability requirement as much as an extensibility one.
-
-### Exit criteria
-
-- Suite 15 (transport integration) passes for REST and WebSocket.
-- Suite 12 (progress) passes: every phase's `total` is known before the phase runs,
-  `completed` never exceeds `total`, and the denominator changes correctly between
-  phases.
-- Every handshake rejection case returns the documented error code.
-- The pull-only client flow works: the server pushes the diff, the client applies it —
-  **in bounded pages**, with the same budget as a bidirectional session.
-- **Suite 20 (paging and budgets) passes**, and **Suite 22 (durable client sessions)**
-  passes: a client that restarts mid-transfer resumes from its cursor.
-- The core has no dependency on axum, and the exchange works over a non-HTTP transport.
-
-**Test suites:** 12, 15, 17, 20, 22.
-
----
-
-## Phase 5 — Lifecycle
-
-**Goal.** Deletes, the purge schedule, the quiesce window, and the staleness rule.
-
-### Deliverables
-
-- The scheduled purge: computing the instants from the epoch, the period and the
-  offset.
-- The quiesce window: refusing sync with `503 PURGE_IN_PROGRESS`, **per table**, and
-  only for tables that actually have tombstones due.
-- `last_purge_instant` advertisement, and the purge floor on incoming rows.
-- The staleness check at handshake, evaluated mesh-wide.
-- The re-seed path: catch-up purge, wipe, pull.
-- The `move_key` operation, atomic across the tombstone and the insert.
-
-### Notes
-
-- **The purge floor applies to tombstones only.** An incoming row is refused iff it is
-  a tombstone whose `purge_on` is at or before the receiver's `last_purge_instant`. A
-  live row is never refused, however old — under a daily purge, a write-timestamp
-  comparison would refuse nearly every live row and break seeding, re-seeding and
-  catch-up. A stale peer's live rows cannot arrive at all, because a stale peer's
-  pushes are refused.
-- **`purge_on` is uniform per window.** It is computed from the delete's window — the
-  interval between two consecutive purge instants — so every tombstone in a window
-  shares one deadline, whatever the ratio of `retention` to `purge_period`, and the
-  tombstone lives at least `retention`. See
-  [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md).
-- **`purge_offset_us` is deployment-wide**, not local policy, and a mismatch is fatal
-  at handshake — the same class as `epoch_us`.
-- **Missing a purge instant is not fatal.** The side that is behind purges locally to
-  the peer's instant and carries on. Only the staleness horizon — `now - last_sync_us >
-  retention` — is fatal.
-- **The staleness rule is evaluated against the mesh-wide last sync**, not per link.
-- **The staleness rule is symmetric.** A stale peer may pull, but it may not push: its
-  pushes are refused with `STALE_PEER`. A session with a stale peer is pull-only.
-- **A re-seed wipes; it never merges.** The stale peer purges locally to the peer's
-  instant, discards its synced state, and pulls the peer's dataset. It does not push:
-  its unsynced writes are discarded, because it cannot tell a row that was deleted and
-  purged while it was away from one that was merely old. See
-  [ADR-0021](doc/adr/0021-re-seed-is-a-wipe.md).
-- `move_key` is the only operation that changes a key, and it is atomic.
-
-### Exit criteria
-
-- Suite 5 (resurrection) passes in both directions: a peer offline longer than the
-  retention is refused and must re-seed; a peer offline for less than the retention
-  receives the tombstone and applies it.
-- Suite 6 (purge) passes: all nodes purge the same set at the same instant; a node
-  offline across a purge purges locally before syncing; sync is refused during the
-  quiesce window.
-- **A live row older than the receiver's `last_purge_instant` is accepted**, and a
-  tombstone the receiver has already purged is refused with `ROW_PURGED`.
-- **A peer that missed a purge instant is not refused** — it catches up and continues.
-- **The quiesce window is per table:** a node with no tombstones due does not quiesce
-  at all, and a session about an unrelated table proceeds during another table's
-  quiesce.
-- **Suite 21 (re-seed) passes:** a stale peer wipes and pulls; its unsynced writes are
-  not pushed, the catch-up purge happens **before** the wipe, and a purged live row is
-  not resurrected.
-- The resurrection invariant is stated as a test, not only as a proof in the docs: a
-  randomised sequence of offline intervals asserts that resurrection never happens —
-  within the retention window or beyond it — and that a peer beyond the horizon
-  re-seeds by wiping.
-
-**Test suites:** 5, 6, 21.
-
----
-
-## Phase 6 — Hardening
-
-**Goal.** Visibility, the cache, the CLI, and observability.
-
-### Deliverables
-
-- The visibility model end to end: the profiles, the projection resolver, filtering at
-  the serialisation boundary, the handshake restriction, and the per-table exclusion.
-- The optional `_sync_audit` table: which peer applied which row, locally.
-- The read-through cache, with the byte and entry bounds.
-- The CLI: `serve`, `pull`, `push`, `inspect`, `tree`, `verify`.
-- Metrics and the health endpoint.
-- The `SecretString` audit: no credential in any log line or error message.
-
-### Notes
-
-- The cache accelerates point lookups by primary key and nothing else. It must not
-  pretend otherwise.
-- Restricted-column filtering happens at serialisation, not at storage, so the cache
-  can hold full rows.
-- `verify` reports and does not repair.
-- **The audit table is off by default, node-local, and not in the digest** — turning it
-  on cannot affect convergence.
-
-### Exit criteria
-
-- Suite 10 (visibility) passes: no restricted value appears anywhere in the wire bytes,
-  in any log line, or in any error message. **This test must never regress.**
-- **Suite 10 also covers the profiles**: a credential column visible master-to-master
-  but not to children; a payload column withheld from clients; a table excluded from
-  one role and included in another.
-- Suite 4 (foreign connections) passes: enforced mode fails closed; compatible mode
-  succeeds and is drained.
-- Suite 7 (clock skew) passes, at the ±5 s default.
-- Suite 11 (key strategies) passes for all five strategies.
-- The full suite passes.
-- `cargo clippy` is clean with no warnings; `cargo fmt --check` is clean.
-- Documentation is updated to match the implementation.
-
-**Test suites:** the full suite.
-
----
+```
+merkle-lww-model      the vocabulary: config, codec, digest, hashes, merge, time
+      │
+      ▼
+merkle-lww-protocol   the wire contract: messages, JSON shapes, handshake rules
+      │
+      ▼
+merkle-lww-core       the engine over SQLite: store, tree, diff, session, lifecycle
+      │
+      ├──────────────► merkle-lww-demo       the conformance harness
+      ▼
+merkle-lww-axum       the transport: REST, WebSocket, progress, compression
+      │
+      ▼
+merkle-lww-cli        the binary
+```
+
+**The order the crates are built in is `model`, `protocol`, `core`, then `demo` and
+`axum` in parallel, then `cli`.** `demo` needs `core` to be useful, but it is small
+enough that its transport and clock can be written against the `protocol` traits while
+`core` is still landing.
+
+## The crate graph
+
+| Crate | Holds | Why it is separate |
+|---|---|---|
+| `merkle-lww-model` | the vocabulary: config, the canonical encoding, the digest, the schema and visibility hashes, the merge rules, time, errors | Pure — no SQLite, no runtime. The compatibility surface is testable without a database and portable to another language; the extension point carries no engine weight |
+| `merkle-lww-protocol` | the wire contract: the message types, the JSON shapes, the tagged value form, the handshake validation rules, the engine traits, the `Transport` trait, the wire version | The wire version and the codec version have different lifecycles. The rules are pure functions over a gathered `LocalView`, so every rejection case is a test with no fixture |
+| `merkle-lww-core` | the engine: store, triggers, authorizer, log, tree, diff, bulk apply, session, paging, lifecycle, cache, registry, allocator, directory, the session journal | Everything that touches SQLite, in one crate — because they share `Db` in nearly every signature |
+| `merkle-lww-axum` | the transport: REST, WebSocket, progress, compression | Where the async boundary is, and where `tokio` lives |
+| `merkle-lww-cli` | the binary: `serve`, `pull`, `push`, `inspect`, `tree`, `verify` | A binary is a different kind of artifact |
+| `merkle-lww-demo` | the in-memory transport, the scripted clock, the two-node fixture, the topology and scenario fixtures | Makes the interface provable and the failure modes deterministic. A crate, so the examples are compiled and run |
+
+The `alloc` feature stays a **feature** of `merkle-lww-core`, not a crate: the allocator
+needs to install triggers and read the registry table inside the same database as
+everything else, and the feature already achieves what a boundary would.
 
 ## Cross-cutting work
 
@@ -520,44 +89,63 @@ The documents in [doc/](doc/) are written before implementation and updated as t
 implementation reveals the design to be wrong. An ADR that turns out to be wrong is
 superseded, not edited.
 
+Each crate's plan has a documentation obligation in its exit criteria, because a
+crate boundary is also a documentation boundary: a reader who wants to know how to
+compute a digest should not have to read the transport's code to find out.
+
 ### Fixtures
 
 | Fixture | Created in | Used by |
 |---|---|---|
-| `golden_vectors.json` | Phase 0 | Suite 14 |
-| `topologies.json` | Phase 3 | Suite 1 |
-| `scenarios.json` | Phase 5 | Suites 5, 6 |
+| `golden_vectors.json` | [model](plan/model.md) M2 | Suite 14 |
+| `schema_hash_vectors.json` | [model](plan/model.md) M3 | the `schema_hash` checks |
+| `visibility_hash_vectors.json` | [model](plan/model.md) M3 | the `visibility_hash` checks |
+| `wire_vectors.json` | [protocol](plan/protocol.md) P1 | the wire contract, cross-implementation |
+| `topologies.json` | [demo](plan/demo.md) D3 | Suite 1 |
+| `scenarios.json` | [demo](plan/demo.md) D3 | Suites 5, 6 |
+
+**The crate that defines a format publishes its vectors.** The digest, the schema hash
+and the visibility hash are defined by `merkle-lww-model`; the wire is defined by
+`merkle-lww-protocol`; the topologies and the lifecycle scenarios are the harness's,
+and belong to `merkle-lww-demo`.
+
+Every fixture is JSON, so it can be shared with an implementation in another language,
+which is the point of specifying the encodings precisely.
 
 ### Tooling
 
 - `cargo fmt`, `cargo clippy` with `-D warnings`.
 - `cargo nextest` for the test runner, once the suite is large enough to warrant it.
-- `cargo-insta` for snapshot tests of the wire format, once it stabilises.
+- `cargo-insta` for snapshot tests, where a snapshot is the right tool. The published
+  vectors are **not** insta snapshots: they are checked-in fixtures, and a change to one
+  is a diff a reviewer sees rather than a snapshot that is regenerated on demand.
 - CI on Linux and macOS, with the SQLite behaviour assertions run against both the
   bundled and the system SQLite where the system build is new enough.
+- **`cargo publish --dry-run` for the published crates**, and a check that
+  `merkle-lww-demo` is not published.
 
 ---
 
 ## Open questions
 
-These are unresolved, and the ones marked **blocking** hold up a specific phase.
+These are unresolved, and the ones marked **blocking** hold up a specific crate.
 
 | # | Question | Impact | Blocking |
 |---|---|---|---|
-| 1 | **Default write dialect.** Enforced (UDF triggers) or compatible (pure-SQL staging)? | Determines whether the application can use `Db::conn()` at all | Phase 1 |
+| 1 | **Default write dialect.** Enforced (UDF triggers) or compatible (pure-SQL staging)? | Determines whether the application can use `Db::conn()` at all | [core](plan/core.md) C1 |
 | 2 | ~~Does the crate terminate TLS?~~ | **Resolved: no.** The crate has no TLS dependency. The application terminates TLS and handles authentication; the crate provides the exchange and the peer check. See [doc/implementation.md](doc/implementation.md) | — |
 | 3 | ~~`GlobalId` or `SiteNamespaced` as the default key strategy?~~ | **Resolved: `GlobalId` default.** The sites share one dataset, so the same user is the same user. `SiteNamespaced` remains available per table for genuinely per-site data. See [ADR-0006](doc/adr/0006-site-namespaced-keys.md) | — |
 | 4 | **How is the digest seed distributed?** Environment variable, mounted secret, or KMS. The crate holds it in memory and **never writes it to the database**; it implements no secret store and no rotation. See Q16 and [ADR-0020](doc/adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | Deployment; not implementation | — |
-| 5 | **Wire format.** JSON, or binary from the start? | Protocol stability | Phase 4 |
+| 5 | ~~Wire format. JSON, or binary from the start?~~ | **Resolved: JSON**, wire version `merkle-lww/1`. Rows are positional arrays over the projection's column list. **Compression is not part of the protocol** — it is a transport-level content encoding, and `merkle-lww-axum` enables zstd level 1 by default. The wire format is outside `schema_hash` and outside the digest, so changing it re-digests nothing. See [ADR-0023](doc/adr/0023-json-wire-format-and-transport-compression.md) | — |
 | 6 | ~~Is the purge period daily, or aligned to the retention window?~~ | **Resolved: daily.** The purge instant is every 24 h, at a deployment-wide offset within the period. The cadence only decides how soon a tombstone is collected; with a 30-day retention a tombstone lives 30–31 days. It does not interact with the purge floor, which applies to tombstones only. See [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md) and [doc/lifecycle.md](doc/lifecycle.md) | — |
-| 7 | **Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?** Only staged rows, presumably, but a row written and deleted within one interval is lost — acceptable, since it was never visible to a peer. | Drain semantics | Phase 1 |
-| 8 | **Should `AppendOnly` tables exist?** They remove the delete machinery from the trigger set, at the cost of a second code path. | Scope of the trigger set | Phase 1 |
+| 7 | **Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?** Only staged rows, presumably, but a row written and deleted within one interval is lost — acceptable, since it was never visible to a peer. | Drain semantics | [core](plan/core.md) C1 |
+| 8 | **Should `AppendOnly` tables exist?** They remove the delete machinery from the trigger set, at the cost of a second code path. | Scope of the trigger set | [core](plan/core.md) C1 |
 | 9 | ~~Should the crate manage the `sync_id` column, or use the application's own key?~~ | **Resolved: the application's own key.** The application's `userid` is already globally unique and never reused, so it *is* the sync key and no extra column is needed. `Derived` covers applications whose key is local or mutable. See [ADR-0012](doc/adr/0012-sync-key-is-the-applications-key.md) | — |
-| 10 | **How is the derivation namespace chosen?** A per-table constant from the table name and `epoch_us` keeps ids stable within a deployment but differs between deployments. | Id stability | Phase 0 |
+| 10 | **How is the derivation namespace chosen?** A per-table constant from the table name and `epoch_us` keeps ids stable within a deployment but differs between deployments. | Id stability | [model](plan/model.md) M2 |
 | 11 | ~~Should the crate own the id allocator?~~ | **Resolved: it may, and it is optional.** The crate offers the allocator and the range registry behind the `alloc` feature; a deployment that brings its own identifier scheme has neither. Owning it makes the "never reused" property a guarantee rather than a convention. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
-| 12 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | Phase 6 |
-| 13 | ~~Who assigns the site ranges, and how?~~ | **Resolved: the deployment does, and the crate enforces locally.** Central assignment plus local enforcement; the crate cannot prevent two nodes from concurrently creating sites with overlapping ranges, because each check passes locally and the merge happens afterwards. Where the crate's own allocator is used, it is the allocator that assigns the ranges. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | Deployment invariant | — |
-| 14 | **Is the `site` column's owner id an opaque id or a readable slug?** A slug is nicer to read and awkward to keep immutable; an opaque id is the reverse. The application owns the `sites` schema, so this is the application's choice — but the crate must not assume a slug is stable. Only applies where the allocation scheme is in use. | Schema ownership | Phase 1 |
+| 12 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | [cli](plan/cli.md) X1 |
+| 13 | ~~Who assigns the site ranges, and how?~~ | **Resolved: the deployment does, and the crate enforces locally.** Central assignment plus local enforcement; the crate cannot prevent two nodes from concurrently creating sites with overlapping ranges, because each check passes locally and the merge happens afterwards. Where the crate's own allocator is used, it is the allocator that assigns the ranges. It is a deployment invariant. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
+| 14 | **Is the `site` column's owner id an opaque id or a readable slug?** A slug is nicer to read and awkward to keep immutable; an opaque id is the reverse. The application owns the `sites` schema, so this is the application's choice — but the crate must not assume a slug is stable. Only applies where the allocation scheme is in use. | Schema ownership | [core](plan/core.md) C1 |
 | 15 | ~~How is the peer credential structured?~~ | **Resolved.** Master-issued UUIDs; a UUID directory propagated master-to-master; role-level master and child strings; the digest seed as a third, independently-rotated value. Per-node revocation is by removing a UUID from the directory. The application's authenticated identity is bound to the claimed node id, and per-node credentials and local attribution are available as options. See [ADR-0020](doc/adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | — |
 | 16 | ~~Where does the digest seed live?~~ | **Resolved.** It is configuration, held in memory, and **never written to the database**. The crate implements no rotation. | — |
 | 17 | ~~How do two peers merge a row when LWW is the wrong rule?~~ | **Resolved.** A per-table merge policy, with two requirements: it must be pure and convergent, and batch repair runs on the sender. See [ADR-0015](doc/adr/0015-per-table-merge-policies-and-write-authority.md) | — |
@@ -565,13 +153,16 @@ These are unresolved, and the ones marked **blocking** hold up a specific phase.
 | 19 | ~~How are visibility classes beyond trusted/client expressed?~~ | **Resolved.** Named visibility profiles mapped to roles, overridable per peer, hashed separately from the schema. See [ADR-0016](doc/adr/0016-visibility-profiles-mapped-to-peer-roles.md) | — |
 | 20 | ~~What does a re-seed do with the stale peer's local writes?~~ | **Resolved: it discards them.** A re-seed is a **wipe** — the stale peer purges locally, discards its synced state, and pulls the peer's dataset. It never pushes: a stale peer cannot tell a row that was deleted and purged while it was away from one that was merely old, so offering them would resurrect them. This makes the resurrection guarantee unconditional. See [ADR-0021](doc/adr/0021-re-seed-is-a-wipe.md) | — |
 | 21 | ~~How are large transfers bounded?~~ | **Resolved.** A byte budget per message, a round limit per session, resumable cursors, and a durable client session. See [ADR-0018](doc/adr/0018-bounded-messages-paged-transfer-and-durable-client-sessions.md) | — |
-| 22 | ~~Must an application use the crate's allocator?~~ | **Resolved.** No. The registry, the `site` column, the range trigger and the REGISTRY phase are all optional. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
+| 22 | ~~Must an application use the crate's allocator?~~ | **Resolved: no.** The registry, the `site` column, the range trigger and the REGISTRY phase are all optional. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
 | 23 | ~~Can an application keep its own write path?~~ | **Resolved.** `Db::register_on(&Connection)` installs the UDFs and the authorizer on a caller-owned connection. See [doc/sqlite-interface.md](doc/sqlite-interface.md) | — |
 | 24 | ~~Is the purge instant fixed, and is `purge_on` per row?~~ | **Resolved.** `purge_on` is computed from the delete's window — the interval between two consecutive purge instants — so every tombstone in a window shares one deadline, and the tombstone lives at least `retention`. The instant carries a deployment-wide `purge_offset_us`, so a deployment can choose when in the period the purge falls. See [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md) | — |
-| 25 | ~~What does a visibility profile do to the digest?~~ | **Resolved.** Nothing: the digest's input is always the full replicated column set. A peer that cannot see a column receives the digest verbatim and never recomputes it, and the tree is unaffected because `row_hash` is a function of the digest. See [ADR-0016](doc/adr/0016-visibility-profiles-mapped-to-peer-roles.md) | — |
+| 25 | ~~What does a visibility profile do to the digest?~~ | **Resolved: nothing.** The digest's input is always the full replicated column set. A peer that cannot see a column receives the digest verbatim and never recomputes it, and the tree is unaffected because `row_hash` is a function of the digest. See [ADR-0016](doc/adr/0016-visibility-profiles-mapped-to-peer-roles.md) | — |
+| 26 | **Is the JSON the public contract, or the Rust API?** The golden wire vectors imply the JSON is frozen and the Rust types are a serialisation of it. If the Rust types are the contract, the JSON can change freely and the vectors are only a convenience. The two readings give different answers to "may I add a field to `Hello`?" — and to whether a Rust consumer and a non-Rust consumer are held to the same shape. | The wire format's evolution policy | [protocol](plan/protocol.md) P1 |
+| 27 | **Should `merkle-lww-model` be published separately, or re-exported through `merkle-lww-core`?** An application that configures the crate and implements a merge policy needs the types either way. Re-exporting keeps the dependency list at one crate; publishing separately makes the compatibility surface a first-class artifact that another language's implementation can be checked against. | The public API shape | [model](plan/model.md) M1 |
 
-Question 1 changes the shape of the code. The rest can be settled during the phase they
+Question 1 changes the shape of the code. The rest can be settled during the crate they
 affect.
+
 ### Question 1, elaborated — the write dialect
 
 The question is not "does the application use `rusqlite`?" It is:
@@ -647,7 +238,6 @@ merging two records would be actively harmful.
 See [doc/data-model.md](doc/data-model.md) § "Key strategies" and
 [ADR-0006](doc/adr/0006-site-namespaced-keys.md).
 
-
 ---
 
 ## Risks
@@ -655,7 +245,7 @@ See [doc/data-model.md](doc/data-model.md) § "Key strategies" and
 | Risk | Likelihood | Mitigation |
 |---|---|---|
 | A SQLite version changes behaviour the design relies on | Low | The behaviour assertions are preserved as tests; they fail loudly rather than subtly |
-| The digest seed leaks to a client | Low | The seed is never sent; a client cannot recompute a digest; the visibility test asserts it |
+| The digest seed leaks to a client | Low | The seed is never sent; a client cannot recompute a digest; Suite 10 asserts it |
 | A deployment mixes enforced and compatible nodes | Medium | The two dialects produce comparable timestamps and identical digests, so mixing is safe; the drain latency is the only difference |
 | The digest or encoding changes after data exists | Low | Both are versioned in `_sync_meta`; the crate refuses to start with a changed version unless told to re-digest |
 | Clock skew beyond the documented `max_skew` (5 s) | Medium | A skew check at handshake; peers believed to be skewed are refused |
@@ -670,3 +260,8 @@ See [doc/data-model.md](doc/data-model.md) § "Key strategies" and
 | A visibility profile diverges between peers, and they project the data differently | Low | `visibility_hash` is compared at handshake and is fatal between trusted peers |
 | A client restarts mid-transfer and restarts from the beginning | Low | The session journal is durable, pages are staged before they are applied, and the cursor advances only after the commit |
 | A deployment sets `retention` shorter than its longest tolerable outage | Low | The staleness rule and the resurrection guarantee both depend on `retention` exceeding the disconnection window. The relationship is stated in `doc/lifecycle.md` § "The constant that makes it true" and in ADR-0021, and the operational requirement is part of the configuration documentation |
+| **The crate boundaries turn out to be wrong, and code has to be moved across them** | Medium | The split was made before any code existed, which is the cheapest moment to make it. The boundaries are also documented with their rationale, so a boundary that turns out to be wrong can be argued against rather than guessed at |
+| **A published crate's API is changed by accident** | Medium | Every type that crosses a crate boundary is published surface. Semver is enforced, the compatibility surface (`merkle-lww-model`) is versioned by `codec_version` independently of the crates' own versions, and the wire contract is versioned by `merkle-lww/1` |
+| **A peer running an older wire version cannot be upgraded in step** | Low | The wire version is carried in the handshake and a mismatch is refused with `PROTOCOL_UNSUPPORTED`. The wire format is outside `schema_hash` and outside the digest, so a version bump re-digests nothing and needs no migration |
+| **The wire format's JSON is larger than it needs to be** | Low | Measured: 14 % larger than a binary framing for row mode, 52 % for digest mode — but **1–4 % once the transport compresses**, which is why compression is the recommendation rather than a binary format. The positional row shape removes the largest source of overhead |
+| **A transport compresses and its peer does not** | Low | The rule is written down: compression is a transport-level content encoding and both peers must agree. The failure is a parse error, not a silent misparse, and it is asserted in the axum plan |

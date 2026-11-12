@@ -350,36 +350,55 @@ the behaviour the design depends on, rather than failing mysteriously later.
 
 ## Fixtures
 
-| Fixture | Purpose |
-|---|---|
-| `golden_vectors.json` | Canonical encoding → digest |
-| `topologies.json` | Multi-node topologies for the convergence test |
-| `scenarios.json` | Named lifecycle scenarios (resurrection, purge race, staleness) |
+| Fixture | Purpose | Published by |
+|---|---|---|
+| `golden_vectors.json` | Canonical encoding → digest | `merkle-lww-model` |
+| `schema_hash_vectors.json` | Registered schema → `schema_hash` | `merkle-lww-model` |
+| `visibility_hash_vectors.json` | Profile definitions → `visibility_hash` | `merkle-lww-model` |
+| `wire_vectors.json` | The exact bytes of every message type | `merkle-lww-protocol` |
+| `topologies.json` | Multi-node topologies for the convergence test | `merkle-lww-demo` |
+| `scenarios.json` | Named lifecycle scenarios (resurrection, purge race, staleness) | `merkle-lww-demo` |
 
 Fixtures are JSON so they can be shared with an implementation in another language, which
 is the point of specifying the encoding precisely.
+
+**The crate that defines a format publishes its vectors.** The digest, the schema hash
+and the visibility hash are defined by `merkle-lww-model`; the wire is defined by
+`merkle-lww-protocol`; the topologies and the lifecycle scenarios are the harness's,
+and belong to `merkle-lww-demo`.
 
 ## Property test seeds
 
 The convergence test should record the seed for every failure. A failing seed is a
 regression test from that point on.
 
-## Acceptance criteria per implementation phase
+## Acceptance criteria per crate
 
-Each phase of [../PLAN.md](../PLAN.md) is measured against these suites:
+The plan is split by crate, and each crate's exit criteria are measured against these
+suites. See [../PLAN.md](../PLAN.md) for the plans.
 
-| Phase | Must pass |
-|---|---|
-| 0 — Foundations | 14, plus the `schema_hash` and `visibility_hash` checks |
-| 1 — Store and enforcement | 2, 3, 13, 18 |
-| 2 — Merkle tree | tree units, and the incremental-vs-rebuild property |
-| 3 — Diff engine | 1, 8, 9, 16, 19 |
-| 4 — Transport | 12, 15, 17, 20, 22 |
-| 5 — Lifecycle | 5, 6, 21 |
-| 6 — Hardening | 4, 7, 10, 11, and the full suite |
+| Crate | Plan | Must pass |
+|---|---|---|
+| `merkle-lww-model` | [M](../plan/model.md) | 14, plus the `schema_hash` and `visibility_hash` checks |
+| `merkle-lww-protocol` | [P](../plan/protocol.md) | the handshake validation table, the wire golden vectors, the value-form round-trip |
+| `merkle-lww-core` | [C](../plan/core.md) | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 18, 19, 20, 21, 22, plus the tree properties |
+| `merkle-lww-axum` | [A](../plan/axum.md) | 10, 12, 15, 17, 20, 22 |
+| `merkle-lww-cli` | [X](../plan/cli.md) | the operational tooling tests, and Suite 10 as it applies to the CLI's output |
+| `merkle-lww-demo` | [D](../plan/demo.md) | the wire-vector assertions, the two-node fixture, the scripted-clock scenarios |
 
-The numbering refers to the suites above. Phase 2's criteria are not numbered because
+The numbering refers to the suites above. The tree criteria are not numbered because
 they are properties of the tree rather than a suite; see "Property tests elsewhere".
+
+Some suites span crates, and each has a **primary** crate — the one where the code
+under test lives:
+
+| Suite | Primary | Also | Notes |
+|---|---|---|---|
+| 1 (convergence) | core | demo | driven by the demo crate's in-memory transport |
+| 10 (visibility) | core | axum, cli | the engine half is core's; the wire bytes and the CLI's output are the other two halves |
+| 17 (peer authentication) | core | axum | the directory, the credential check and the identity binding live in core; the transport carries them |
+| 20 (paging and budgets) | core | axum | the budget is the engine's; the transport must not break it |
+| 22 (durable client sessions) | core | axum | the staging and the resume are the engine's; the transport only carries them |
 
 ## Test dependencies
 
@@ -389,7 +408,10 @@ instances, each with its own SQLite file, exchanging through an in-memory transp
 
 That requires the transport to be abstracted behind a trait rather than being HTTP-only.
 This is a design constraint that should be honoured in the implementation: **the sync
-engine must not depend on axum.**
+engine must not depend on axum.** The in-memory transport and the two-node fixture live
+in `merkle-lww-demo`, and the scripted clock there replaces sleeps with time
+advancement — which is what makes the lifecycle failure modes deterministic rather than
+flaky.
 
 ## Property tests elsewhere
 
@@ -409,5 +431,6 @@ trustworthy, and drift would be invisible until it caused a permanent divergence
 
 - [sqlite-interface.md](sqlite-interface.md) — the mechanics under test
 - [lifecycle.md](lifecycle.md) — the resurrection and purge scenarios
-- [security.md](security.md) — the visibility leak test
-- [../PLAN.md](../PLAN.md) — phase ordering and exit criteria
+- [security.md](security.md) — the trust model behind Suite 10
+- [../PLAN.md](../PLAN.md) — the crate index, the open questions and the risks
+- [../plan/](../plan/) — one plan per crate

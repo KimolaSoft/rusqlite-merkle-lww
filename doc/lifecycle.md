@@ -72,7 +72,7 @@ local policy: peers that disagree about it would purge at different moments.
 
 Because `purge_on` is computed from the delete's **window**, and the windows are on a
 fixed schedule, **every tombstone created in the same window has the same `purge_on`**.
-The purge is therefore one indexed delete on a constant predicate, and the purged set is
+The purge is therefore one indexed delete on a single predicate, and the purged set is
 identical on every node by arithmetic rather than by agreement:
 
 ```

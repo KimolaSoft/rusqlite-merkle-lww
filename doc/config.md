@@ -279,6 +279,7 @@ See [data-model.md](data-model.md) § "Key strategies" for the trade-offs.
 ```rust
 pub struct ColumnSpec {
     pub name:       String,
+    pub r#type:     ColumnType,         // Null | Integer | Real | Text | Blob
     pub replicated: bool,          // participates in sync and in the digest
     pub visibility: Visibility,    // Public | Restricted
     pub local:      bool,          // meaningful only on the writing site
@@ -288,6 +289,12 @@ pub struct ColumnSpec {
 
 A column that is not `replicated` is local-only: it is not synced, not hashed, and not
 part of the digest.
+
+**The declared type is the column's affinity, not a guarantee about the value.** SQLite
+is dynamically typed, so a `text` column can hold an integer. The type is carried on
+the wire so a receiver can decode a row's positional values, and it is part of
+`schema_hash`, because the digest's input depends on the storage class of each value.
+See [protocol.md](protocol.md) § "Message encoding" for the wire form.
 
 A column marked `local: true` **is** replicated, but is never overwritten by a remote
 write, and is **excluded from the digest** — otherwise two peers holding the same entity
