@@ -73,7 +73,9 @@ a bidirectional peer.
 ### 5. A client can resume after a restart
 
 A client persists its session in a node-local `_sync_session` table, and stages the
-pages it receives before applying them:
+pages it receives in a node-local `_sync_page` table before applying them. Staging is
+**dialect-independent** — the enforced dialect is the default, so the crash-safety
+guarantee cannot depend on the compatible dialect's staging table being present.
 
 ```sql
 CREATE TABLE _sync_session (

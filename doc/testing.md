@@ -80,6 +80,11 @@ documentation rather than silently changing the contract.
   rows — and assert it is accepted.
 - **A tombstone the receiver has already purged is refused** with `ROW_PURGED`, and the
   sender purges it at the next instant.
+- **A stale peer's push is refused**, in both directions, with `STALE_PEER`. A session
+  with a stale peer is pull-only.
+- **The resurrection invariant is unconditional**: a peer offline across the whole
+  retention window — long enough for its tombstone to be purged — cannot bring a
+  deleted row back, because it re-seeds by wiping and never pushes.
 
 ### 6. Purge
 
@@ -92,6 +97,21 @@ documentation rather than silently changing the contract.
   nothing due does not quiesce at all.
 - **Missing a purge instant is not fatal.** A peer whose `last_purge_instant` is behind
   catches up and the session continues; no error is raised.
+- **`purge_on` is uniform per window.** A *window* is the interval between two
+  consecutive purge instants. Two rows deleted in the same window get the same
+  `purge_on`, whatever the ratio of `retention` to `purge_period` — assert this with a
+  retention that is **not** a whole number of periods, which is the case a simpler
+  rounding rule gets wrong.
+- **A tombstone lives at least `retention`.** Assert `purge_on - delete_time ≥
+  retention` for a delete at the start of a window and at the end of one.
+- **A node that missed an instant purges its backlog.** A tombstone whose deadline has
+  passed is removed at the next instant, not orphaned.
+- **`purge_on` is only ever set on a deleted row.** A live row's `purge_on` is NULL,
+  and a direct write to the column is denied.
+- **`purge_offset_us` moves the instant.** A deployment with a non-zero offset purges
+  at that offset, and every node agrees on the instant.
+- **A `purge_offset_us` mismatch is fatal at handshake** with
+  `PURGE_SCHEDULE_MISMATCH`, like `epoch_us`.
 
 ### 7. Clock skew
 
@@ -128,10 +148,18 @@ documentation rather than silently changing the contract.
 - **`visibility_hash`**: two trusted peers with different profile definitions are
   refused at handshake with `VISIBILITY_MISMATCH`; a client does not compare it and
   does not fail.
+- **The digest's input is the full replicated column set.** A child whose profile hides
+  a column and a master that can see it agree on the digest of the same row: the child
+  receives the digest verbatim and never recomputes it.
+- **The tree is unaffected by a narrow profile.** A peer holding a partial row still
+  computes the same `row_hash` and its tree matches the master's — asserted by running
+  a diff between a master and a child with a narrower profile.
+- **A profile may narrow a `Public` column.** A profile that hides a public column from
+  one role is honoured, and the column does not appear in that peer's rows.
 
 ### 11. Key strategies
 
-- For each of the four strategies, run the convergence test.
+- For each of the five strategies, run the convergence test.
 - Assert the expected cross-site behaviour: `GlobalId` merges; the others do not.
 - Assert key columns are immutable — attempting to change one is refused, and
   `move_key` is atomic.
@@ -245,7 +273,9 @@ language can implement the same format.
   `MasterOnly` table is refused with `WRITE_NOT_PERMITTED`, even when it arrives via a
   master.
 - **A peer may not write a table whose columns its profile hides.**
-- **A policy that returns "undecided" falls through to the LWW + digest tie-break.**
+- **A policy that returns `Undecided` falls through to the LWW + digest tie-break.**
+  The variant exists and is reachable; a policy author must never have to invent a
+  decision for a case they do not understand.
 
 ### 20. Paging and message budgets
 
@@ -260,17 +290,28 @@ language can implement the same format.
   with `SESSION_LIMIT`, and re-opening it with the last cursor continues the transfer.
 - **The pull-only client flow uses the same bounds**: the server's proactive push is
   paged, and the client applies every page.
+- **The cursor has one shape.** A `next_cursor` returned by a response is accepted
+  verbatim as the `cursor` of the next request — same fields, including `as_of_us`.
+- **A cursor from a different `as_of_us` is rejected**, not applied.
+- **The ROWS response carries the origin**, because that is where the rows are: a row
+  whose origin lacks write authority is refused with `WRITE_NOT_PERMITTED` on receipt,
+  not only when it is requested.
 
 ### 21. Re-seed
 
-- **A stale peer keeps its unsynced local writes.** A child accepts writes while
-  offline, goes stale, and re-seeds. Assert the writes are present afterwards, and that
-  the peer has them too.
-- **The push happens before the pull**, so the peer's older copy of the child's row
-  does not overwrite it.
+- **A re-seed is a wipe.** A child accepts writes while offline, goes stale, and
+  re-seeds. Assert the child's unsynced writes are **not** pushed, that they are gone
+  from the child afterwards, and that the child ends up with the peer's copy of the
+  rows.
+- **A stale peer does not push.** A session with a stale peer is pull-only: the stale
+  peer's pushes are refused with `STALE_PEER`, in both directions.
 - **A re-seed does not resurrect a purged tombstone**: the stale peer purges locally to
   the peer's instant first, and the tombstone is gone from both sides afterwards.
-- **Live rows the peer does not have are kept**, not deleted.
+- **A re-seed does not resurrect a purged live row either**: a peer that was offline
+  across the whole retention window holds a stale *live* copy of a row that was deleted
+  and purged while it was away. Assert the master refuses it and the row stays gone.
+- **The catch-up purge happens before the wipe**, so the stale peer does not carry its
+  own tombstones into the rebuild.
 - **A client re-seed is a pull** — it has no local writes, and the result is the same.
 
 ### 22. Durable client sessions
@@ -279,6 +320,9 @@ language can implement the same format.
   client, and assert it continues from its cursor rather than starting again.
 - **The cursor advances only after the commit**: a crash between "received" and
   "applied" loses nothing — the staged rows are applied on restart.
+- **Staging is dialect-independent.** The durable staging table exists and is used in
+  the **enforced** dialect, which is the default. The compatible dialect's drainer
+  staging is a different thing and does not stand in for it.
 - **The session survives the idle TTL** when it has a persisted cursor.
 - **Ordering**: tables are synced in `sync_priority` order — core tables first — and
   within a table the newest buckets arrive first.
@@ -326,10 +370,10 @@ Each phase of [../PLAN.md](../PLAN.md) is measured against these suites:
 
 | Phase | Must pass |
 |---|---|
-| 0 — Foundations | 14, and the allocator's "never reused" property |
+| 0 — Foundations | 14, plus the `schema_hash` and `visibility_hash` checks |
 | 1 — Store and enforcement | 2, 3, 13, 18 |
 | 2 — Merkle tree | tree units, and the incremental-vs-rebuild property |
-| 3 — Diff engine | 1, 8, 9, 19 |
+| 3 — Diff engine | 1, 8, 9, 16, 19 |
 | 4 — Transport | 12, 15, 17, 20, 22 |
 | 5 — Lifecycle | 5, 6, 21 |
 | 6 — Hardening | 4, 7, 10, 11, and the full suite |

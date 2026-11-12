@@ -69,17 +69,23 @@ memory files must be local.
 ## Configuration deployment
 
 The values that must agree across peers — `epoch_us`, `digest_seed`, `retention`,
-`purge_period` — are best delivered by the same mechanism the consumer already uses for
-other shared state: an environment variable, a mounted secret, a config-management
-system.
+`purge_period`, `purge_offset_us` — are best delivered by the same mechanism the
+consumer already uses for other shared state: an environment variable, a mounted
+secret, a config-management system.
 
 They **MUST NOT** differ between peers. A mismatch is a fatal handshake error, not a
-degraded mode, except for `retention` and `purge_period` where a drift would cause
-peers to purge different sets. Those two are checked at handshake and the peer is
-rejected.
+degraded mode. In particular, a mismatch in `retention`, `purge_period` or
+`purge_offset_us` means the peers would purge different sets at different moments, so
+those three are checked at handshake and the peer is rejected with
+`PURGE_SCHEDULE_MISMATCH`.
 
 `epoch_us` additionally cannot change once data exists, because changing it re-buckets
 every row.
+
+`retention` carries an operational requirement on top of the protocol one: it must
+exceed the longest disconnection the deployment can tolerate, because the tombstone
+evidence has to outlive every peer that could be holding a stale copy of a deleted
+row. See [lifecycle.md](lifecycle.md) § "The constant that makes it true".
 
 ## The CLI
 
@@ -167,11 +173,11 @@ It has been offline longer than the retention window. This is by design — it c
 trusted to sync incrementally, because it may hold rows whose deletions were purged
 before it heard about them.
 
-The remedy is a re-seed. A re-seed is a **merge, not a wipe**: the stale peer pushes its
-unsynced local writes to the peer, then pulls the peer's full dataset, and keeps the
-rows the peer does not have. Nothing local is thrown away — in particular, a child that
-was the primary for its own site while offline keeps those writes. Expect the transfer
-to take a while and to move a lot of data; that is the cost of a long outage.
+The remedy is a re-seed. A re-seed is a **wipe**: the stale peer discards its synced
+state and pulls the peer's full dataset. It does not push, so **any writes it accepted
+while it was disconnected are lost** — that is the cost of having been away longer than
+the tombstone evidence lasts, and the reason a peer in that position is not trusted to
+sync incrementally. Expect the transfer to take a while and to move a lot of data.
 
 **A peer that merely missed a purge instant is not stale.** It catches up by purging
 locally and continues in the same session; there is no error and no re-seed.

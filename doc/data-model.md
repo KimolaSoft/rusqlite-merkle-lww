@@ -23,7 +23,7 @@ The managed column names are configurable per table; these are the defaults.
 |---|---|---|---|
 | `last_update` | TEXT | always | RFC 3339 instant of the last modification. **The ordering key.** |
 | `status` | TEXT | always | `'live'` or `'deleted'` |
-| `purge_on` | TEXT | always | When the row may be physically removed. NULL while live. |
+| `purge_on` | TEXT | always | When the row may be physically removed. NULL while live. It is the engine's value, computed from the delete's window, so every tombstone in a window shares one deadline. See [lifecycle.md](lifecycle.md) |
 | `site` | TEXT | when the table has allocated identifiers | The site that owns the identifier. See below. |
 | *the key column* | — | only if the app has no usable key | **The sync key.** See below. |
 
@@ -119,8 +119,8 @@ it. See [adr/0019](adr/0019-the-allocation-registry-is-optional.md).
 
 See [examples.md](examples.md) § "Allocating locally, and never reusing" for the two
 schemes and § "Example 3 — `sites`" for the registry, and
-[adr/0013-site-registry-and-range-allocation.md](adr/0013-site-registry-and-range-allocation.md)
-for the full decision.
+[adr/0019-the-allocation-registry-is-optional.md](adr/0019-the-allocation-registry-is-optional.md)
+for the current decision.
 
 ### The `site` column
 
@@ -415,6 +415,12 @@ pub enum MergeDecision {
     KeepLocal,
     /// A row synthesised from both — e.g. a field-wise merge.
     Merged(Row),
+    /// The policy cannot decide this pair. The default LWW + digest tie-break applies.
+    ///
+    /// This is the escape hatch for a policy that meets a case it does not
+    /// understand. Without it, a policy author has to invent a decision for every
+    /// case, and inventing one is how a custom policy diverges.
+    Undecided,
     /// Refuse the row, with a reason.
     Reject(RejectReason),
 }
@@ -447,8 +453,12 @@ same logical row, and the trees would never converge. A receiver-side repair is 
 safe if it is a deterministic function of the replicated row set that every peer
 computes identically, which in practice means doing it before the rows are sent.
 
-The digest tie-break remains the fallback: a policy that returns "undecided" falls
-through to LWW on `(last_update, digest)`.
+The digest tie-break remains the fallback: a policy that returns `Undecided` falls
+through to LWW on `(last_update, digest)`. The fallback covers a policy that **cannot
+decide**; it does not cover one that decides wrongly. A non-convergent policy returns a
+definite decision, so the tie-break never fires and the crate cannot detect it — which
+is why the convergence suite runs with a custom policy in the loop
+([testing.md](testing.md) § 19).
 
 What the hook is for, concretely:
 
@@ -636,8 +646,7 @@ Keys: `node_id`, `site`, `epoch_us`, `schema_version`, `last_purge_instant`,
 
 **No secret material is stored here.** The digest seed and the role strings are supplied
 by the application as configuration and held in memory for the life of the process. See
-[adr/0014-peer-credentials-and-the-uuid-directory.md](adr/0014-peer-credentials-and-the-uuid-directory.md)
-§ 5.
+[adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md](adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md).
 
 ```sql
 CREATE TABLE _sync_log (
@@ -683,7 +692,8 @@ or site-namespaced keys. It would become a full decode of every row at startup.
 
 `purge_on_us` is the same idea for the tombstone deadline: it is `NULL` while the row
 is live, and it makes "which tables have tombstones due at instant T" an indexed
-existence query instead of a scan. See [protocol.md](protocol.md) § "The purge quiesce
+existence query instead of a scan. Because `purge_on` is uniform per window, the purge
+is an equality predicate on it. See [protocol.md](protocol.md) § "The purge quiesce
 window".
 
 ```sql
@@ -717,11 +727,28 @@ boundary, and it is withheld from children for exactly that reason.
 
 ```sql
 -- Compatible dialect only (§ sqlite-interface.md)
+-- The compatible dialect's drainer staging: rows written by a connection the crate
+-- did not instrument, waiting for the drainer to compute their digests.
 CREATE TABLE _sync_staging (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     tbl       TEXT NOT NULL,
     op        TEXT NOT NULL,
     payload   BLOB NOT NULL
+);
+```
+
+```sql
+-- Durable staging for received pages. Node-local, NOT replicated.
+-- Both dialects: a client (or any peer resuming a durable session) stages a page
+-- here before applying it, so a crash between "received" and "applied" loses
+-- nothing. The cursor advances only after the applying transaction commits.
+CREATE TABLE _sync_page (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT    NOT NULL,
+    tbl        TEXT    NOT NULL,
+    page_seq   INTEGER NOT NULL,
+    payload    BLOB    NOT NULL,   -- the encoded page, exactly as received
+    applied_us INTEGER             -- NULL until the page has been applied
 );
 ```
 
@@ -883,6 +910,22 @@ identifiers, because it is replicated and both peers must agree on it.
 The **table name** is in the input, so a digest identifies a row *of a particular table*,
 not just a row. Two tables with identical columns and identical values do not produce
 the same digest.
+
+**The input is the full replicated column set, whatever the receiver may see.** A
+visibility profile decides what is *sent*, never what is *hashed*. A peer whose profile
+hides a replicated column therefore cannot compute that table's digest — it receives the
+digest verbatim and never recomputes it, the same treatment a client gets for not
+holding the seed. Two consequences follow, and both are wanted:
+
+- **Peers with different views agree on the digest.** A child that cannot see a
+  credential column and a master that can still agree on the digest of the same row.
+- **The tree is unaffected.** `row_hash` is a function of the digest, not of the
+  payload, so a peer holding a partial row still computes the same `row_hash` and its
+  tree still matches.
+
+The peer that *may* write a table is the one whose profile exposes every replicated
+column of it, because a row it cannot digest is a row it cannot produce — see
+[ADR-0015](adr/0015-per-table-merge-policies-and-write-authority.md) § 5.
 
 The type tags are load-bearing:
 

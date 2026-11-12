@@ -54,7 +54,8 @@ The secret is shared by every node that computes a digest — all trusted peers,
 children**, which write rows — and is **absent from clients**. It is a third value,
 separate from the two peer credential strings, and it is rotated independently of them;
 deriving it from a credential would couple a routine credential rotation to a full
-dataset rebuild. See [ADR-0014](0014-peer-credentials-and-the-uuid-directory.md).
+dataset rebuild. See [ADR-0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md),
+which carries this forward from ADR-0014.
 
 The digest is 16 bytes, big-endian on the wire, and compared as an unsigned 128-bit
 integer.

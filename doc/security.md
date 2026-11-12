@@ -195,7 +195,7 @@ for the material that authenticates a peer. The consequence is that the crate ha
 rotation logic**; rotation is an application concern, and an application that wants
 managed rotation can put a crate in front of this one.
 
-See [adr/0014-peer-credentials-and-the-uuid-directory.md](adr/0014-peer-credentials-and-the-uuid-directory.md).
+See [adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md](adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md).
 
 ## TLS
 
@@ -340,8 +340,8 @@ life of the process, and never written to the database. An earlier revision stor
 It is a **third value**, separate from the two credential strings, and it is rotated
 independently of them. Deriving it from a credential would couple a routine credential
 rotation to a full dataset rebuild — every stored digest and every tree leaf would
-change. See [adr/0014-peer-credentials-and-the-uuid-directory.md](adr/0014-peer-credentials-and-the-uuid-directory.md)
-§ 4.
+change. See [adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md](adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md)
+§ 1.
 
 ### The three secrets side by side
 

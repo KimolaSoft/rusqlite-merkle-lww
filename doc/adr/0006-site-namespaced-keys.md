@@ -1,8 +1,27 @@
 # ADR-0006: Site-namespaced keys, with `GlobalId` as the default for shared datasets
 
-- **Status:** accepted
+- **Status:** extended by [ADR-0012](0012-sync-key-is-the-applications-key.md); partially superseded by [ADR-0019](0019-the-allocation-registry-is-optional.md)
 - **Date:** 2026-11
 - **Deciders:** project maintainers
+
+> **Partially superseded, and extended.** Three clauses of this record no longer hold:
+>
+> - **The `site` column is not "where the row was last written".** Where the
+>   allocation scheme is in use, `site` names the site that **owns** the identifier,
+>   and it is stable for the life of the row — see
+>   [ADR-0013](0013-site-registry-and-range-allocation.md) § 3 and
+>   [ADR-0019](0019-the-allocation-registry-is-optional.md). Tracking the writer would
+>   move a row's owner under it and break the range invariant on a legitimate edit.
+> - **There is no `site` column by default.** The allocation scheme is optional, so a
+>   deployment that brings its own identifiers has no `site` column at all — see
+>   [ADR-0019](0019-the-allocation-registry-is-optional.md).
+> - **There are five strategies, not four.** `Derived` was added by
+>   [ADR-0012](0012-sync-key-is-the-applications-key.md): a deterministic id computed
+>   by the crate from the table's identity columns, for applications whose own key is
+>   local or mutable.
+>
+> The decision this record makes — **`GlobalId` is the default key strategy**, with
+> `SiteNamespaced` available per table for genuinely per-site data — **stands**.
 
 ## Context
 

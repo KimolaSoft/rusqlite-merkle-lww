@@ -1,8 +1,19 @@
 # ADR-0008: Two peer identity layers
 
-- **Status:** accepted
+- **Status:** partially superseded by [ADR-0014](0014-peer-credentials-and-the-uuid-directory.md), [ADR-0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md)
 - **Date:** 2026-11
 - **Deciders:** project maintainers
+
+> **Partially superseded.** The **two-layer model** this record decides — a stable node id
+> plus a separate credential — **stands**. Two details have moved on:
+>
+> - The `PeerAuth` enum below is superseded. The current enum, which adds a per-node
+>   secret alongside the role-level one, is in
+>   [ADR-0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md).
+> - The amendment below is carried forward by
+>   [ADR-0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md),
+>   which supersedes ADR-0014 and adds the application's authenticated identity as the
+>   binding of a claimed node id.
 
 ## Context
 
@@ -70,7 +81,10 @@ responsibility between the crate and the application.
 
 ## Amendment
 
-[ADR-0014](0014-peer-credentials-and-the-uuid-directory.md) extends this decision:
+[ADR-0014](0014-peer-credentials-and-the-uuid-directory.md) extends this decision
+(it has since been superseded by
+[ADR-0020](0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md),
+which carries these points forward):
 
 - the `node_id` is **issued by a master**, not self-generated;
 - a **UUID directory** sits between identity and credential — every node's UUID, merged

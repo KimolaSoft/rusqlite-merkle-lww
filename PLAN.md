@@ -23,15 +23,13 @@ Phase 2 ── Merkle tree
 Phase 3 ── Diff engine
    │
    ├── Phase 4 ── Transport
-   │      │
-   │   Phase 5 ── Lifecycle
    │
    └── Phase 5 ── Lifecycle
-   
+           │
 Phase 6 ── Hardening (after 4 and 5)
 ```
 
-Phases 4 and 5 can proceed in parallel once Phase 3 lands.
+Phases 4 and 5 can proceed in parallel once Phase 3 lands, and Phase 6 follows both.
 
 ---
 
@@ -45,7 +43,8 @@ encoding.
 - Workspace with three crates: `merkle-lww-core`, `merkle-lww-axum`, `merkle-lww-cli`.
 - `config.rs`: `SyncConfig`, `TableSpec`, `ColumnSpec`, `KeyStrategy`, `Visibility`,
   `TableKind`, `MergeMode`, `MergePolicy`, `WriteAuthority`, `Peer`, `PeerAuth`,
-  `CacheConfig`, `Role`, `WriteMode`. All `serde`-derived with `Default`.
+  `CacheConfig`, `Role`, `WriteMode`, `AllocationSpec`. All `serde`-derived with
+  `Default`.
 - `merge.rs`: `MergePolicy`, `MergePolicyFn`, `MergeContext`, `MergeDecision` — the
   extension points and the rules they must obey.
 - `visibility.rs`: `VisibilityProfile`, `ProfileTable`, the projection resolver, and
@@ -56,12 +55,7 @@ encoding.
   registered column order.
 - `time.rs`: RFC 3339 parsing and formatting at fixed six-digit precision; the
   monotonic issuance guard.
-- `allocator.rs`: the globally-unique id allocator — per-site ranges and a durable
-  monotonic counter. **Behind the optional `alloc` feature**; the sync core does not
-  depend on it.
 - `error.rs`: the error type, including the protocol error codes.
-- `directory.rs`: the UUID directory — the local table, the handshake merge, and the
-  per-node revocation check.
 - `SecretString`: a wrapper whose `Debug` does not print its contents.
 
 **The crate persists no secret material.** The digest seed, the role strings and the peer
@@ -79,9 +73,6 @@ written to the database, and the crate implements no rotation.
 - **`KeyStrategy::GlobalId` uses the application's own column** when it is already globally
   unique and stable, so no extra column is added. `Derived` covers the applications that
   cannot offer one.
-- **The id allocator guarantees "never reused".** Allocation is durable and happens
-  *before* use: a gap is harmless, a reuse is corruption. The counter must not roll back
-  with a transaction, so it is advanced outside the insert's transaction.
 - **Local columns are excluded from the digest**, not merely from the merge. Including
   them would make two peers holding the same entity compute different digests, so every
   bucket would differ and nothing would ever converge.
@@ -90,37 +81,20 @@ written to the database, and the crate implements no rotation.
   logical row — permanent, silent divergence. The order is not an implementation detail.
 - **The digest is 16 bytes, big-endian on the wire, compared as a `u128`.** Comparing raw
   bytes in memory order would let two peers disagree on an exact-timestamp tie.
-- **The `site` column is in the digest**, because it is replicated and both peers must
-  agree on it.
+- **The digest's input is the full replicated column set**, never the columns a
+  particular peer may see. Visibility decides what is sent, not what is hashed; a peer
+  that cannot see a column receives the digest verbatim and never recomputes it. The tree
+  is unaffected, because `row_hash` is a function of the digest and not of the payload.
 - **The digest seed is a third value**, separate from the two credential strings and
   rotated independently. Deriving it from a credential would couple a routine credential
   rotation to a full dataset rebuild.
-- The range-allocation table is **deployment-wide state**, like the epoch and the digest
-  seed, because peers need it to validate the identifiers they receive. It is the
-  replicated **`sites` registry**, and it must live in the **main database** — triggers
-  cannot reference an attached database.
-- **The allocator is optional.** A deployment that brings its own identifier scheme
-  declares no `AllocationSpec`, and then there is no registry, no `site` column, no
-  range trigger and no REGISTRY phase. The allocator lives behind the `alloc` feature,
-  and the sync core does not depend on it. See
-  [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md).
-- **The registry's range is immutable.** A site is renamed; its range is not moved. A
-  decommissioned site's range is retired forever, like a retired identifier.
-- **A row names the site that owns its identifier, not the site that last wrote it.** The
-  `site` column is replicated and in the digest; the range check is keyed on it, so a
-  peer's rows are accepted on the same terms as local ones.
-- **The range check fires only when the registry knows the owner.** A site created
-  mid-session may have its rows arrive before the registry row does; rejecting them would
-  deadlock the conversation, so they are accepted provisionally and re-validated later.
-- **The registry is exchanged before the data** in every session — when it is in use —
-  and is part of the join bundle alongside the epoch and the digest seed.
 - **The visibility profiles are deployment-wide state too**, and a divergence is fatal
   between trusted peers. `visibility_hash` is separate from `schema_hash`, because a
   client's registration is necessarily narrower and could never match the full schema
   hash.
 - **A custom merge policy must be pure and convergent.** The crate cannot check it, so
-  it is a stated requirement on the application; the digest tie-break remains the
-  fallback for "undecided". See
+  it is a stated requirement on the application; a policy that returns `Undecided` falls
+  through to the digest tie-break. See
   [ADR-0015](doc/adr/0015-per-table-merge-policies-and-write-authority.md).
 
 ### Exit criteria
@@ -133,16 +107,6 @@ written to the database, and the crate implements no rotation.
   lexicographically in chronological order.
 - **The derived sync id is deterministic**: the same identity columns produce the same
   id on every node, and different identity columns produce different ids.
-- **The allocator never reissues an identifier**: after a crash and restart, the next
-  allocated id is strictly greater than every previously allocated one.
-- **The range check rejects a bad mint and accepts a peer's rows**: an identifier outside
-  the row's own site's range is refused, and one inside it is accepted — including on the
-  `ON CONFLICT DO UPDATE` path.
-- **The registry enforces its own invariants**: an overlapping range is refused on insert,
-  a range change is refused on update, and a descriptive update is accepted.
-- **The `site` column is filled by the engine, not the application**: an insert that
-  omits it gets the local site, an explicit value wins, and a connection without the UDF
-  fails closed.
 - **The key encoding is the value encoding**: `userid = 10001` produces the same tagged
   bytes in `_sync_log.k`, in the digest input, and on the wire — and the same rule covers
   a composite key.
@@ -151,10 +115,12 @@ written to the database, and the crate implements no rotation.
 - **The visibility hash covers exactly the profile definitions**, and is separate from
   the schema hash: a client with a narrower registration still matches a master's
   projection.
-- **The crate builds without the `alloc` feature**, and a deployment with no
-  `AllocationSpec` has no registry, no `site` column and no range trigger.
+- **A peer with a narrower profile agrees with a peer with a wider one** on the digest
+  of the same row, and its tree matches: the digest is received verbatim, and the tree
+  is a function of the digest rather than of the payload.
 
-**Test suites:** 14 (canonical encoding), plus the allocator and registry suites.
+**Test suites:** 14 (canonical encoding), plus the schema-hash and visibility-hash
+checks.
 
 ---
 
@@ -184,7 +150,11 @@ verified experimentally rather than documented (see
   no-overlap triggers, the per-row range-enforcement trigger, and the `site` column
   default. **Only when the `alloc` feature is enabled and a table declares an
   `AllocationSpec`.**
-- `session_store.rs`: the `_sync_session` table — a client's durable session journal.
+- `allocator.rs`: the globally-unique id allocator — per-site ranges and a durable
+  monotonic counter. **Behind the optional `alloc` feature**; the sync core does not
+  depend on it.
+- `session_store.rs`: the `_sync_session` table — a client's durable session journal,
+  and the `_sync_page` table it stages received pages in.
 - DDL management: `create_table`, `alter_table`, `adopt_table`, `drop_table`.
 - The UDFs: `sync_stamp()`, `sync_us(text)`, `sync_digest(...)`, and — on tables with
   allocated identifiers — `local_site()`.
@@ -219,6 +189,24 @@ verified experimentally rather than documented (see
   integer for bucketing and range scans, and it never reads a payload column.
 - **`purge_on_us` is NULL while a row is live**, which makes "which tables have
   tombstones due at instant T" an indexed existence query.
+- **The allocator guarantees "never reused".** Allocation is durable and happens
+  *before* use: a gap is harmless, a reuse is corruption. The counter must not roll back
+  with a transaction, so it is advanced outside the insert's transaction.
+- **The allocator is optional.** A deployment that brings its own identifier scheme
+  declares no `AllocationSpec`, and then there is no registry, no `site` column, no
+  range trigger and no REGISTRY phase. The allocator lives behind the `alloc` feature,
+  and the sync core does not depend on it. See
+  [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md).
+- **The registry's range is immutable.** A site is renamed; its range is not moved. A
+  decommissioned site's range is retired forever, like a retired identifier.
+- **A row names the site that owns its identifier, not the site that last wrote it.** The
+  `site` column is replicated and in the digest; the range check is keyed on it, so a
+  peer's rows are accepted on the same terms as local ones.
+- **The range check fires only when the registry knows the owner.** A site created
+  mid-session may have its rows arrive before the registry row does; rejecting them would
+  deadlock the conversation, so they are accepted provisionally and re-validated later.
+- **The registry is exchanged before the data** in every session — when it is in use —
+  and is part of the join bundle alongside the epoch and the digest seed.
 
 ### Exit criteria
 
@@ -226,23 +214,28 @@ verified experimentally rather than documented (see
 - Suite 3 (trigger mechanics) passes: one log row and one stamp per update, no
   recursion, identical behaviour with `recursive_triggers` on and off.
 - Suite 13 (DDL) passes.
+- Suite 18 (site registry and allocation) passes.
 - The SQLite behaviour assertions are preserved as tests, so a SQLite upgrade that
   changes the semantics the design relies on fails loudly.
 - A raw `INSERT` on a managed table from an instrumented connection results in a
   stamped row and a correct `_sync_log` entry, verified by inspecting the database
   directly rather than through the crate's API.
+- **The allocator never reissues an identifier**: after a crash and restart, the next
+  allocated id is strictly greater than every previously allocated one.
 - **The registry enforces its invariants**: an overlapping range is refused on insert, a
   range change is refused on update, and a descriptive update is accepted.
 - **The range check rejects a bad mint, accepts a peer's rows, and defers an unknown
   owner** — including on the `ON CONFLICT DO UPDATE` path.
 - **The `site` column is filled by the engine**: an insert that omits it gets the local
   site, an explicit value wins, and a connection without the UDF fails closed.
+- **The crate builds without the `alloc` feature**, and a deployment with no
+  `AllocationSpec` has no registry, no `site` column and no range trigger.
 - **A caller-owned connection behaves like a pooled one**: after `register_on`, a write
   is stamped and logged, and the authorizer denies the same operations.
 - **The monotonic guard holds across connection kinds**: a timestamp issued on a
   caller-owned connection is greater than the last one issued on a pooled one.
 
-**Test suites:** 2, 3, 13, plus the registry suite.
+**Test suites:** 2, 3, 13, 18.
 
 ---
 
@@ -340,7 +333,7 @@ verified experimentally rather than documented (see
 - **A page never exceeds `max_message_bytes`,** and a page re-issued with a cursor
   continues exactly where the last one stopped.
 
-**Test suites:** 1, 8, 9, 19, plus the bulk-apply suite.
+**Test suites:** 1, 8, 9, 16, 19.
 
 ---
 
@@ -355,6 +348,8 @@ transport-agnostic core.
   `transport` carries request and response messages. The session state machine must not
   know about HTTP.
 - `merkle-lww-axum`: the REST endpoints and the WebSocket handler, built on the core.
+- `directory.rs`: the UUID directory — the local table, the handshake merge, and the
+  per-node revocation check.
 - Sessions: opaque `session_id`, in-memory, five-minute **idle** TTL. A client that
   needs to survive a restart persists its session in `_sync_session` and re-opens it by
   id.
@@ -401,7 +396,7 @@ transport-agnostic core.
   passes: a client that restarts mid-transfer resumes from its cursor.
 - The core has no dependency on axum, and the exchange works over a non-HTTP transport.
 
-**Test suites:** 12, 15, 20, 22.
+**Test suites:** 12, 15, 17, 20, 22.
 
 ---
 
@@ -411,12 +406,13 @@ transport-agnostic core.
 
 ### Deliverables
 
-- The scheduled purge: computing the instants from the epoch and the period.
+- The scheduled purge: computing the instants from the epoch, the period and the
+  offset.
 - The quiesce window: refusing sync with `503 PURGE_IN_PROGRESS`, **per table**, and
   only for tables that actually have tombstones due.
 - `last_purge_instant` advertisement, and the purge floor on incoming rows.
 - The staleness check at handshake, evaluated mesh-wide.
-- The re-seed path: catch-up purge, push, pull, keep.
+- The re-seed path: catch-up purge, wipe, pull.
 - The `move_key` operation, atomic across the tombstone and the insert.
 
 ### Notes
@@ -425,14 +421,26 @@ transport-agnostic core.
   a tombstone whose `purge_on` is at or before the receiver's `last_purge_instant`. A
   live row is never refused, however old — under a daily purge, a write-timestamp
   comparison would refuse nearly every live row and break seeding, re-seeding and
-  catch-up.
+  catch-up. A stale peer's live rows cannot arrive at all, because a stale peer's
+  pushes are refused.
+- **`purge_on` is uniform per window.** It is computed from the delete's window — the
+  interval between two consecutive purge instants — so every tombstone in a window
+  shares one deadline, whatever the ratio of `retention` to `purge_period`, and the
+  tombstone lives at least `retention`. See
+  [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md).
+- **`purge_offset_us` is deployment-wide**, not local policy, and a mismatch is fatal
+  at handshake — the same class as `epoch_us`.
 - **Missing a purge instant is not fatal.** The side that is behind purges locally to
   the peer's instant and carries on. Only the staleness horizon — `now - last_sync_us >
   retention` — is fatal.
 - **The staleness rule is evaluated against the mesh-wide last sync**, not per link.
-- **A re-seed merges; it never wipes.** The stale peer pushes its unsynced local rows
-  first, then pulls the peer's dataset, and keeps the rows the peer does not have. See
-  [ADR-0017](doc/adr/0017-re-seed-is-a-merge-not-a-wipe.md).
+- **The staleness rule is symmetric.** A stale peer may pull, but it may not push: its
+  pushes are refused with `STALE_PEER`. A session with a stale peer is pull-only.
+- **A re-seed wipes; it never merges.** The stale peer purges locally to the peer's
+  instant, discards its synced state, and pulls the peer's dataset. It does not push:
+  its unsynced writes are discarded, because it cannot tell a row that was deleted and
+  purged while it was away from one that was merely old. See
+  [ADR-0021](doc/adr/0021-re-seed-is-a-wipe.md).
 - `move_key` is the only operation that changes a key, and it is atomic.
 
 ### Exit criteria
@@ -449,11 +457,13 @@ transport-agnostic core.
 - **The quiesce window is per table:** a node with no tombstones due does not quiesce
   at all, and a session about an unrelated table proceeds during another table's
   quiesce.
-- **Suite 21 (re-seed) passes:** a child that accepted writes while offline keeps them
-  through a re-seed, and the tombstone is still purged.
+- **Suite 21 (re-seed) passes:** a stale peer wipes and pulls; its unsynced writes are
+  not pushed, the catch-up purge happens **before** the wipe, and a purged live row is
+  not resurrected.
 - The resurrection invariant is stated as a test, not only as a proof in the docs: a
-  randomised sequence of offline intervals asserts that resurrection never happens
-  within the retention window, and always requires a re-seed beyond it.
+  randomised sequence of offline intervals asserts that resurrection never happens —
+  within the retention window or beyond it — and that a peer beyond the horizon
+  re-seeds by wiping.
 
 **Test suites:** 5, 6, 21.
 
@@ -537,29 +547,31 @@ These are unresolved, and the ones marked **blocking** hold up a specific phase.
 | 1 | **Default write dialect.** Enforced (UDF triggers) or compatible (pure-SQL staging)? | Determines whether the application can use `Db::conn()` at all | Phase 1 |
 | 2 | ~~Does the crate terminate TLS?~~ | **Resolved: no.** The crate has no TLS dependency. The application terminates TLS and handles authentication; the crate provides the exchange and the peer check. See [doc/implementation.md](doc/implementation.md) | — |
 | 3 | ~~`GlobalId` or `SiteNamespaced` as the default key strategy?~~ | **Resolved: `GlobalId` default.** The sites share one dataset, so the same user is the same user. `SiteNamespaced` remains available per table for genuinely per-site data. See [ADR-0006](doc/adr/0006-site-namespaced-keys.md) | — |
-| 4 | **How is the digest seed distributed?** Environment variable, mounted secret, or KMS. The crate holds it in memory and **never writes it to the database**; it implements no secret store and no rotation. See Q16 and [ADR-0014](doc/adr/0014-peer-credentials-and-the-uuid-directory.md) | Deployment; not implementation | — |
+| 4 | **How is the digest seed distributed?** Environment variable, mounted secret, or KMS. The crate holds it in memory and **never writes it to the database**; it implements no secret store and no rotation. See Q16 and [ADR-0020](doc/adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | Deployment; not implementation | — |
 | 5 | **Wire format.** JSON, or binary from the start? | Protocol stability | Phase 4 |
-| 6 | ~~Is the purge period daily, or aligned to the retention window?~~ | **Resolved: daily.** The purge instant is every 24 h, epoch-aligned. The cadence only decides how soon a tombstone is collected; with a 30-day retention a tombstone lives 30–31 days. It does not interact with the purge floor, which applies to tombstones only. See [doc/lifecycle.md](doc/lifecycle.md) | — |
+| 6 | ~~Is the purge period daily, or aligned to the retention window?~~ | **Resolved: daily.** The purge instant is every 24 h, at a deployment-wide offset within the period. The cadence only decides how soon a tombstone is collected; with a 30-day retention a tombstone lives 30–31 days. It does not interact with the purge floor, which applies to tombstones only. See [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md) and [doc/lifecycle.md](doc/lifecycle.md) | — |
 | 7 | **Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?** Only staged rows, presumably, but a row written and deleted within one interval is lost — acceptable, since it was never visible to a peer. | Drain semantics | Phase 1 |
 | 8 | **Should `AppendOnly` tables exist?** They remove the delete machinery from the trigger set, at the cost of a second code path. | Scope of the trigger set | Phase 1 |
 | 9 | ~~Should the crate manage the `sync_id` column, or use the application's own key?~~ | **Resolved: the application's own key.** The application's `userid` is already globally unique and never reused, so it *is* the sync key and no extra column is needed. `Derived` covers applications whose key is local or mutable. See [ADR-0012](doc/adr/0012-sync-key-is-the-applications-key.md) | — |
 | 10 | **How is the derivation namespace chosen?** A per-table constant from the table name and `epoch_us` keeps ids stable within a deployment but differs between deployments. | Id stability | Phase 0 |
-| 11 | **Should the crate own the id allocator?** The "never reused" property needs a durable, monotonic, pre-allocated counter and a range check. Owning it makes the property a guarantee rather than a convention. | API scope | Phase 0 |
+| 11 | ~~Should the crate own the id allocator?~~ | **Resolved: it may, and it is optional.** The crate offers the allocator and the range registry behind the `alloc` feature; a deployment that brings its own identifier scheme has neither. Owning it makes the "never reused" property a guarantee rather than a convention. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
 | 12 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | Phase 6 |
-| 13 | **Who assigns the site ranges, and how?** The crate cannot prevent two nodes from concurrently creating sites with overlapping ranges — each check passes locally, and the merge happens afterwards. Central assignment plus local enforcement is the current answer; a crate-side allocator is a possible extension. | Deployment invariant | Phase 0 |
-| 14 | **Is the `site` column's owner id an opaque id or a readable slug?** A slug is nicer to read and awkward to keep immutable; an opaque id is the reverse. The application owns the `sites` schema, so this is the application's choice — but the crate must not assume a slug is stable. | Schema ownership | Phase 0 |
-| 15 | ~~How is the peer credential structured?~~ | **Resolved.** Master-issued UUIDs; a UUID directory propagated master-to-master; role-level master and child strings; the digest seed as a third, independently-rotated value. Per-node revocation is by removing a UUID from the directory. The application's authenticated identity is bound to the claimed node id, and per-node credentials and local attribution are available as options. See [ADR-0014](doc/adr/0014-peer-credentials-and-the-uuid-directory.md) and [ADR-0020](doc/adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | — |
+| 13 | ~~Who assigns the site ranges, and how?~~ | **Resolved: the deployment does, and the crate enforces locally.** Central assignment plus local enforcement; the crate cannot prevent two nodes from concurrently creating sites with overlapping ranges, because each check passes locally and the merge happens afterwards. Where the crate's own allocator is used, it is the allocator that assigns the ranges. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | Deployment invariant | — |
+| 14 | **Is the `site` column's owner id an opaque id or a readable slug?** A slug is nicer to read and awkward to keep immutable; an opaque id is the reverse. The application owns the `sites` schema, so this is the application's choice — but the crate must not assume a slug is stable. Only applies where the allocation scheme is in use. | Schema ownership | Phase 1 |
+| 15 | ~~How is the peer credential structured?~~ | **Resolved.** Master-issued UUIDs; a UUID directory propagated master-to-master; role-level master and child strings; the digest seed as a third, independently-rotated value. Per-node revocation is by removing a UUID from the directory. The application's authenticated identity is bound to the claimed node id, and per-node credentials and local attribution are available as options. See [ADR-0020](doc/adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | — |
 | 16 | ~~Where does the digest seed live?~~ | **Resolved.** It is configuration, held in memory, and **never written to the database**. The crate implements no rotation. | — |
 | 17 | ~~How do two peers merge a row when LWW is the wrong rule?~~ | **Resolved.** A per-table merge policy, with two requirements: it must be pure and convergent, and batch repair runs on the sender. See [ADR-0015](doc/adr/0015-per-table-merge-policies-and-write-authority.md) | — |
 | 18 | ~~How is a row's write authority decided?~~ | **Resolved.** Per table, against the **origin** of the row — the node that wrote it — which the wire now carries. See [ADR-0015](doc/adr/0015-per-table-merge-policies-and-write-authority.md) | — |
 | 19 | ~~How are visibility classes beyond trusted/client expressed?~~ | **Resolved.** Named visibility profiles mapped to roles, overridable per peer, hashed separately from the schema. See [ADR-0016](doc/adr/0016-visibility-profiles-mapped-to-peer-roles.md) | — |
-| 20 | ~~What does a re-seed do with the stale peer's local writes?~~ | **Resolved.** It merges: push the unsynced local rows first, then pull, and keep the rows the peer does not have. See [ADR-0017](doc/adr/0017-re-seed-is-a-merge-not-a-wipe.md) | — |
+| 20 | ~~What does a re-seed do with the stale peer's local writes?~~ | **Resolved: it discards them.** A re-seed is a **wipe** — the stale peer purges locally, discards its synced state, and pulls the peer's dataset. It never pushes: a stale peer cannot tell a row that was deleted and purged while it was away from one that was merely old, so offering them would resurrect them. This makes the resurrection guarantee unconditional. See [ADR-0021](doc/adr/0021-re-seed-is-a-wipe.md) | — |
 | 21 | ~~How are large transfers bounded?~~ | **Resolved.** A byte budget per message, a round limit per session, resumable cursors, and a durable client session. See [ADR-0018](doc/adr/0018-bounded-messages-paged-transfer-and-durable-client-sessions.md) | — |
 | 22 | ~~Must an application use the crate's allocator?~~ | **Resolved.** No. The registry, the `site` column, the range trigger and the REGISTRY phase are all optional. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
 | 23 | ~~Can an application keep its own write path?~~ | **Resolved.** `Db::register_on(&Connection)` installs the UDFs and the authorizer on a caller-owned connection. See [doc/sqlite-interface.md](doc/sqlite-interface.md) | — |
+| 24 | ~~Is the purge instant fixed, and is `purge_on` per row?~~ | **Resolved.** `purge_on` is computed from the delete's window — the interval between two consecutive purge instants — so every tombstone in a window shares one deadline, and the tombstone lives at least `retention`. The instant carries a deployment-wide `purge_offset_us`, so a deployment can choose when in the period the purge falls. See [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md) | — |
+| 25 | ~~What does a visibility profile do to the digest?~~ | **Resolved.** Nothing: the digest's input is always the full replicated column set. A peer that cannot see a column receives the digest verbatim and never recomputes it, and the tree is unaffected because `row_hash` is a function of the digest. See [ADR-0016](doc/adr/0016-visibility-profiles-mapped-to-peer-roles.md) | — |
 
-Questions 1 and 3 change the shape of the code. The rest can be settled during the phase
-they affect.
+Question 1 changes the shape of the code. The rest can be settled during the phase they
+affect.
 ### Question 1, elaborated — the write dialect
 
 The question is not "does the application use `rusqlite`?" It is:
@@ -624,9 +636,10 @@ user" to hold, the id must be:
 - derived deterministically from a natural key — `uuidv5(namespace, "user:alice")`; or
 - assigned by something upstream that already agrees across sites.
 
-The crate should offer a `Surrogate` variant that derives a deterministic UUIDv5 from the
-table's natural key columns, so an application can opt into merging without changing its
-schema.
+The crate should offer a `Derived` variant that computes a deterministic UUIDv5 from
+the table's identity columns, so an application can opt into merging without changing
+its schema. `Surrogate` remains available for tables that genuinely must not merge: it
+is a random UUIDv7 and never merges across sites.
 
 `SiteNamespaced` stays available per table for data that is genuinely per-site — where
 merging two records would be actively harmful.
@@ -650,8 +663,10 @@ See [doc/data-model.md](doc/data-model.md) § "Key strategies" and
 | A bulk apply exceeds SQLite's 32,766 bound-parameter limit | Medium | The chunk size is derived from the column count, and the JSON path uses a single parameter regardless of batch size. A 50,000-row batch is covered by a test |
 | The application generates random ids where deterministic ones were needed, so rows never merge | Medium | Documented prominently in the key-strategy section and ADR-0006; `verify` can report entities that exist at more than one site with the same natural key |
 | A site uses `GlobalId` on data that is genuinely per-site, and two records merge | Low | `SiteNamespaced` is a per-table option; the failure is data loss, so the default should be reviewed when the deployment shape changes |
-| A custom merge policy is not convergent, and two peers diverge silently | Medium | The requirement is documented as a hard rule and in ADR-0015; the digest tie-break remains the fallback; the convergence suite runs with a custom policy in the loop. **The crate cannot detect this** — it is the one extension point that can break the core guarantee |
-| A re-seed discards a peer's unsynced local writes | Low | The re-seed is a merge, not a wipe: push, then pull, then keep. Suite 21 asserts it explicitly |
+| A custom merge policy is not convergent, and two peers diverge silently | Medium | The requirement is documented as a hard rule and in ADR-0015; the convergence suite runs with a custom policy in the loop. **The crate cannot detect this** — it is the one extension point that can break the core guarantee. The `Undecided` fallback covers a policy that *cannot decide*, not one that decides wrongly: a non-convergent policy returns a definite decision, so the tie-break never fires |
+| A re-seed discards a peer's unsynced local writes | Low | The re-seed is a wipe by design: a peer disconnected for longer than `retention` is not a valid instance, and the tombstone evidence cannot outlive that outage anyway. The loss is confined to a peer beyond the staleness horizon, and Suite 21 asserts the behaviour explicitly |
+| A stale peer pushes a row that was deleted and purged while it was away | Low | Staleness is symmetric: a stale peer's pushes are refused with `STALE_PEER`, and it re-seeds by pulling. The purge floor remains the last line of defence for tombstones |
 | A page cursor is stale or from a different `as_of_us`, and a transfer resumes at the wrong place | Low | The cursor is derived from deterministic ordering, re-sending a page is idempotent, and a mismatched cursor is rejected rather than applied |
 | A visibility profile diverges between peers, and they project the data differently | Low | `visibility_hash` is compared at handshake and is fatal between trusted peers |
 | A client restarts mid-transfer and restarts from the beginning | Low | The session journal is durable, pages are staged before they are applied, and the cursor advances only after the commit |
+| A deployment sets `retention` shorter than its longest tolerable outage | Low | The staleness rule and the resurrection guarantee both depend on `retention` exceeding the disconnection window. The relationship is stated in `doc/lifecycle.md` § "The constant that makes it true" and in ADR-0021, and the operational requirement is part of the configuration documentation |

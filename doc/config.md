@@ -31,6 +31,7 @@ pub struct SyncConfig {
     pub digest_seed:   [u8; 32],
     pub retention:     Duration,      // 30d
     pub purge_period:  Duration,      // 24h
+    pub purge_offset_us: i64,         // offset within the period at which the purge instant falls
     pub visibility_hash: VisibilityHash,  // derived from `profiles`
 
     // ---- local identity ----
@@ -89,8 +90,9 @@ rather than a policy difference. These are checked at handshake and a mismatch i
 |---|---|---|
 | `epoch_us` | Bucket boundaries. A mismatch means the trees are not comparable | `EPOCH_MISMATCH` |
 | `digest_seed` | The digest is keyed. A mismatch means every row hash differs | `DIGEST_SEED_MISMATCH` |
-| `retention` | Sets the purge horizon. Peers must agree on when a tombstone expires | rejected |
-| `purge_period` | Derives the global purge instants | rejected |
+| `retention` | Sets the purge horizon. Peers must agree on when a tombstone expires | `PURGE_SCHEDULE_MISMATCH` |
+| `purge_period` | Derives the global purge instants | `PURGE_SCHEDULE_MISMATCH` |
+| `purge_offset_us` | Where within the period each purge instant falls. A mismatch means peers purge at different moments | `PURGE_SCHEDULE_MISMATCH` |
 | `codec_version` | The canonical encoding. A change re-digests every row | `CODEC_MISMATCH` |
 | `schema_hash` | Exactly the inputs to the row digest — see below | `SCHEMA_MISMATCH` |
 | `visibility_hash` | The visibility profile definitions — see below | `VISIBILITY_MISMATCH` |
@@ -155,6 +157,12 @@ bucket boundaries agree. Any fixed value works. Midnight UTC on some epoch is a
 conventional choice because it makes the boundaries line up with the calendar, but it is
 not required. Once chosen, **it cannot change** — changing it re-buckets every row and
 invalidates every stored hash.
+
+`purge_offset_us` is the same kind of value: an **offset within `purge_period`** at which
+the purge instant falls. It is deployment-wide, not local policy — peers that disagree
+about it purge at different moments, which is a correctness bug. Expressing it as an
+offset rather than a wall-clock time of day keeps it free of timezone and daylight-saving
+ambiguity, and it composes with a `purge_period` that is not a whole number of days.
 
 ## May differ
 
@@ -306,8 +314,9 @@ pub struct ProfileTable {
 ```
 
 Profiles are mapped to roles by `role_profile`, and a specific peer may override the
-mapping with its own `profile` field. A `Public` column is visible to every profile; a
-`Restricted` column only to `trusted` ones.
+mapping with its own `profile` field. A `Public` column is visible to every profile
+**unless that profile narrows it** — a profile may hide a public column from a
+particular role or peer. A `Restricted` column is visible only to `trusted` profiles.
 
 ### Merge policies and write authority
 
@@ -387,7 +396,7 @@ is in the peer list.
 | Peer list | The consumer's config, passed to the crate |
 | TLS material | The consumer's, referenced by path or bytes |
 | `epoch_us`, `digest_seed` | Shared across the deployment; the consumer distributes them |
-| `retention`, `purge_period` | Shared across the deployment |
+| `retention`, `purge_period`, `purge_offset_us` | Shared across the deployment |
 | `profiles` | Shared across the deployment — a divergence is `VISIBILITY_MISMATCH` |
 | master / child string | The consumer's; **never written to the database** |
 | per-node secret | The consumer's; **never written to the database** |
@@ -409,6 +418,7 @@ role     = "master"
 epoch_us = 1735689600000000          # same everywhere
 retention = "30d"
 purge_period = "24h"
+purge_offset_us = 0                    # same everywhere; the instant within the period
 
 # The three secrets. The consumer's business, not ours — and never written
 # to the database by the crate.

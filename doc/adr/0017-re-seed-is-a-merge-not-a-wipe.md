@@ -1,8 +1,12 @@
 # ADR-0017: Re-seed is a merge, not a wipe
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0021](0021-re-seed-is-a-wipe.md)
 - **Date:** 2026-11
 - **Deciders:** project maintainers
+
+> **Superseded.** [ADR-0021](0021-re-seed-is-a-wipe.md) decides that a re-seed is a
+> **wipe**. The merge is retained below as the record of the reasoning that led to it,
+> and the reasoning that overturned it.
 
 ## Context
 

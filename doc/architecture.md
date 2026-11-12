@@ -78,7 +78,7 @@ the default follows the expected deployment — see
 
 The hierarchy controls **connectivity and write authority, not storage**.
 
-│ Node | Holds |
+| Node | Holds |
 |---|---|
 | **master** | **all** application data, for the entire deployment |
 | **child** | all application data, except the UUID directory |
@@ -270,13 +270,21 @@ rusqlite-merkle-lww/
 │   │       ├── visibility.rs  # VisibilityProfile, projections, visibility_hash
 │   │       ├── merge.rs       # MergePolicy, MergePolicyFn, WriteAuthority
 │   │       ├── codec.rs       # canonical encoding, digest, seeded xxh3
+│   │       ├── schema.rs      # schema_hash
 │   │       ├── time.rs        # RFC 3339, monotonic issuance
+│   │       ├── error.rs       # the error type and the protocol error codes
 │   │       ├── store.rs       # Db, pool, managed tables, DDL
 │   │       ├── trigger.rs     # trigger installation, both dialects
 │   │       ├── authorizer.rs  # sqlite3_set_authorizer rules
 │   │       ├── log.rs         # _sync_log reads/writes
+│   │       ├── registry.rs    # the optional site registry and range triggers
+│   │       ├── allocator.rs   # the optional id allocator (feature "alloc")
+│   │       ├── directory.rs   # the UUID directory
+│   │       ├── session_store.rs # the durable client session journal
 │   │       ├── merkle.rs      # bucket tree, hashes, snapshot
 │   │       ├── diff.rs        # comparison and merge
+│   │       ├── bulk.rs        # bulk apply, chunking, the parameter limit
+│   │       ├── paging.rs      # page cursors and the byte budget
 │   │       ├── session.rs     # protocol state machine
 │   │       └── cache.rs       # read-through cache
 │   ├── merkle-lww-axum/
@@ -289,6 +297,10 @@ rusqlite-merkle-lww/
 │       └── src/
 │           └── main.rs
 ```
+
+The optional pieces — the registry, the allocator and the `site` column — live behind
+the `alloc` feature and are not dependencies of the sync core. See
+[ADR-0019](adr/0019-the-allocation-registry-is-optional.md).
 
 ## Threading model
 
@@ -351,11 +363,11 @@ Progress is reported throughout. See [protocol.md](protocol.md) § "Progress".
 
 ## Failure modes this shape creates
 
-The design deliberately creates three, and each has a documented answer:
+The design deliberately creates four, and each has a documented answer:
 
 | Failure | Answer |
 |---|---|
-| A peer is offline longer than the retention window | The staleness rule refuses incremental sync; the peer re-seeds by **merging**, pushing its unsynced writes first and keeping its local rows — [lifecycle.md](lifecycle.md) |
+| A peer is offline longer than the retention window | The staleness rule refuses incremental sync, in both directions; the peer re-seeds by **wiping** and pulling the peer's dataset cleanly — [lifecycle.md](lifecycle.md) |
 | A purge happens while a peer is offline | The returning peer detects the newer purge instant at handshake and purges locally first — a **catch-up purge**, not an error — [lifecycle.md](lifecycle.md) |
 | A row is edited without moving `last_update` | Detected by the stored digest; reported by `verify` — [data-model.md](data-model.md) § "Divergence detection" |
 | Two peers apply a custom merge policy to the same pair of rows and disagree | The policy was not convergent; the crate cannot detect this, so the policy must be pure — [data-model.md](data-model.md) § "Merge policies" |
@@ -363,7 +375,9 @@ The design deliberately creates three, and each has a documented answer:
 The first two are the only ones that can cause permanent divergence, and both are
 prevented by rules rather than by hope. The third is detected but not repaired — an
 out-of-band edit cannot be ordered correctly, because the information needed to order it
-was never recorded.
+was never recorded. The fourth is the one failure the crate **cannot** detect: a
+non-convergent merge policy returns a definite decision, so the digest tie-break never
+fires. That is why the convergence suite runs with a custom policy in the loop.
 
 ## Related documents
 

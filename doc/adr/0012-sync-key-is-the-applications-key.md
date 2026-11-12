@@ -109,7 +109,8 @@ accepts a peer's rows on the same terms. It fires on the `ON CONFLICT DO UPDATE`
 too.
 
 Where the ranges live, and what the row's `site` column means, is settled in
-[ADR-0013](0013-site-registry-and-range-allocation.md).
+[ADR-0013](0013-site-registry-and-range-allocation.md) and
+[ADR-0019](0019-the-allocation-registry-is-optional.md).
 
 ### Local columns
 
@@ -151,7 +152,9 @@ differ, and nothing would ever converge.
 
 - The `site` column is a **crate-managed** column on tables with allocated identifiers,
   naming the site that owns the identifier. It is what makes the range check possible.
-  See [ADR-0013](0013-site-registry-and-range-allocation.md).
+  It exists only where the allocation scheme is in use — see
+  [ADR-0013](0013-site-registry-and-range-allocation.md) and
+  [ADR-0019](0019-the-allocation-registry-is-optional.md).
 - The `Surrogate` strategy remains available for tables that genuinely must not merge.
 
 ## Alternatives considered

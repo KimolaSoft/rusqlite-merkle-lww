@@ -531,6 +531,6 @@ Everything above was checked against rusqlite 0.41.1 with bundled SQLite 3.54.1.
 - [merkle.md](merkle.md) — how the digest and tree hashes are computed
 - [bulk-apply.md](bulk-apply.md) — applying many rows at once
 - [sqlite-interface.md](sqlite-interface.md) — the trigger set
-- [adr/0013-site-registry-and-range-allocation.md](adr/0013-site-registry-and-range-allocation.md) — the registry decision
+- [adr/0019-the-allocation-registry-is-optional.md](adr/0019-the-allocation-registry-is-optional.md) — the registry decision
 - [adr/0019-the-allocation-registry-is-optional.md](adr/0019-the-allocation-registry-is-optional.md) — the registry is optional
 - [../PLAN.md](../PLAN.md) — where the allocator and column-locality work lands

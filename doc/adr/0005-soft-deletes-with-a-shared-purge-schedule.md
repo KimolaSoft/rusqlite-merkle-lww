@@ -1,8 +1,18 @@
 # ADR-0005: Soft deletes with a shared purge schedule
 
-- **Status:** accepted
+- **Status:** partially superseded by [ADR-0022](0022-one-purge-instant-per-window.md)
 - **Date:** 2026-11
 - **Deciders:** project maintainers
+
+> **Partially superseded.** The decision this record makes — **deletions are soft, and
+> tombstones are purged at a globally scheduled instant that all nodes compute
+> identically** — **stands**, and so does the resurrection invariant below.
+>
+> [ADR-0022](0022-one-purge-instant-per-window.md) changes two mechanics: `purge_on` is
+> now computed from the delete's **window** — the interval between two consecutive
+> purge instants — so every tombstone in a window shares one deadline; and the schedule
+> carries a deployment-wide `purge_offset_us`. The rule `purge_on = now + retention`
+> below is superseded.
 
 ## Context
 

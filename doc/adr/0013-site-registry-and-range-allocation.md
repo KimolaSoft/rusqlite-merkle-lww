@@ -1,8 +1,14 @@
 # ADR-0013: A site registry in the main database; a row names the site that owns its identifier
 
-- **Status:** superseded by [ADR-0019](0019-the-allocation-registry-is-optional.md)
+- **Status:** partially superseded by [ADR-0019](0019-the-allocation-registry-is-optional.md)
 - **Date:** 2026-11
 - **Deciders:** project maintainers
+
+> **Partially superseded.** [ADR-0019](0019-the-allocation-registry-is-optional.md) makes
+> the whole arrangement optional: a deployment that brings its own identifier scheme has
+> no registry, no `site` column, no range check and no `REGISTRY` phase. **Everything
+> else in this record stands** — in particular that a row names the site that *owns* its
+> identifier rather than the site that last wrote it, and that the range is immutable.
 
 ## Context
 

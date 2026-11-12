@@ -27,9 +27,14 @@ The requirements that make this hard:
 
 - The projection must be **declarative**, because it has to be compared between peers
   and stored in a hash.
-- It must **not** affect the digest. Two peers that see different columns must still
-  compute the same digest for the same logical row — otherwise a child and a master
-  holding the same row would never converge.
+- It must **not** affect the digest's input. The digest is always computed over the
+  table's **full replicated column set**, never over the columns a particular peer may
+  see, so two peers that see different columns still agree on the digest for the same
+  logical row, and a child and a master holding the same row converge.
+- A peer that **cannot** see every replicated column of a table therefore **cannot**
+  compute that table's digest. It receives the digest verbatim and never recomputes it,
+  the same treatment a client gets for not holding the seed. This does not affect the
+  tree: `row_hash` is a function of the digest, not of the payload.
 - A read-only client necessarily has a **narrower registration** than a master. If the
   registration is what is hashed, a client can never match a master's hash, and the
   existing "client schema mismatch is a warning, trusted peer mismatch is fatal" rule

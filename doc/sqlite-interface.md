@@ -283,6 +283,11 @@ historical timestamp of a row can write it directly, and the crate will not over
 because both are `UPDATE`s. The authorizer solves it: `status` and `purge_on` writes are
 denied unless the connection's privilege flag is set.
 
+The crate's soft delete sets **both** columns in one statement, and `purge_on` is the
+engine's value — computed from the delete's window, so every tombstone in a window
+shares one deadline. The application never supplies it. See
+[lifecycle.md](lifecycle.md) § "The purge instant".
+
 ### Recursion
 
 The nested `UPDATE` inside `sync_device_bu` re-enters that trigger. The `WHEN
@@ -430,12 +435,16 @@ primary mechanism, because it covers a wider set of actions.
 **The remaining gap.** A foreign connection in compatible mode can write `status` or
 `purge_on` directly, because the authorizer is not present to deny it. Such a write is
 caught by the AFTER UPDATE trigger and staged, so the change *propagates* — but the
-application has bypassed the crate's soft-delete path, and the resulting tombstone may
-have an inconsistent `purge_on`.
+application has bypassed the crate's soft-delete path. The **drainer normalises** the
+value: when it stages a tombstone whose `purge_on` is not one of the schedule's
+instants, it rewrites it to the deadline its window implies, so
+the uniform-per-window rule holds even in compatible mode. The remaining gap is
+therefore only the *timing* of the delete — the tombstone is created when the drainer
+runs rather than when the application wrote it — and not its deadline.
 
 This is acceptable because it requires the application to deliberately write a
 crate-managed column, which is already documented as forbidden, and the consequence is a
-possibly-wrong tombstone deadline rather than silent divergence. It is **not** acceptable
+possibly-late tombstone rather than silent divergence. It is **not** acceptable
 in enforced mode, which is one more reason enforced mode is the default.
 
 A foreign connection can also forge the guard markers, since it can write any table.

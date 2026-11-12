@@ -65,8 +65,11 @@ write produces a digest. Clients get none of the three.
 **None of them is written to the database.** The crate holds them in memory and
 implements no rotation — that is your layer. See [security.md](security.md).
 
-`epoch_us` must be identical across every trusted peer, and so must `digest_seed`. See
-[config.md](config.md).
+`epoch_us` must be identical across every trusted peer, and so must `digest_seed`, and
+so must `retention`, `purge_period` and `purge_offset_us` — the purge schedule is
+deployment-wide, because peers that purge at different moments purge different sets.
+`retention` must also exceed the longest disconnection your deployment can tolerate.
+See [config.md](config.md) and [lifecycle.md](lifecycle.md).
 
 ### 2. Describe your tables
 
@@ -192,8 +195,9 @@ let profiles = vec![
 
 The rules are short:
 
-- A `Public` column is visible to every profile. A `Restricted` column is visible only
-  to `trusted` profiles.
+- A `Public` column is visible to every profile **unless that profile narrows it** — a
+  profile may hide a public column from a particular role or peer. A `Restricted` column
+  is visible only to `trusted` profiles.
 - A table with `visible: false` is absent from that class of peer entirely — its
   existence and its shape are not advertised.
 - A specific peer may override its role's profile (`Peer.profile`), which is how one
@@ -515,7 +519,8 @@ overlap".
 - [ ] All nodes share the same `epoch_us` and `digest_seed`.
 - [ ] All nodes share the same visibility profiles (`visibility_hash` agrees).
 - [ ] All nodes are within `max_skew` of each other — 5 seconds by default.
-- [ ] `retention` and `purge_period` match across peers.
+- [ ] `retention`, `purge_period` and `purge_offset_us` match across peers, and
+      `retention` exceeds the longest tolerable disconnection.
 - [ ] The application uses `Db::conn()`, the connection factory, or `register_on` for
       managed tables.
 - [ ] TLS is terminated somewhere.

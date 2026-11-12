@@ -29,6 +29,8 @@ differing rows and receives the peer's — so there is no separate push API.
   "as_of_us": 1792953600000000,
   "last_purge_instant": 1792617600000000,
   "retention_us": 2592000000000,
+  "purge_period_us": 86400000000,
+  "purge_offset_us": 0,
   "last_sync_us": 1792950000000000,
   "registry": { "enabled": true },   // false when the deployment brings its own ids
   "tables": [ { "name": "device",
@@ -107,7 +109,8 @@ A client sends no directory and receives none.
 | `node_id` differs from the application's authenticated identity | `IDENTITY_MISMATCH` — fatal; the peer is not who the transport says it is |
 | credential does not verify for the claimed role | `BAD_CREDENTIAL` |
 | `as_of_us` differs by more than the tolerance | the server's wins; the client adopts it |
-| `last_sync_us` — peer is older than the staleness horizon | `STALE_PEER` — the peer must re-seed (see [lifecycle.md](lifecycle.md)) |
+| `last_sync_us` — peer is older than the staleness horizon | `STALE_PEER` — the peer must re-seed, and the session is **pull-only** (see [lifecycle.md](lifecycle.md)) |
+| `purge_period_us` or `purge_offset_us` differs | `PURGE_SCHEDULE_MISMATCH` — fatal; the peers would purge different sets at different moments |
 | `last_purge_instant` — peer is newer than ours | **not a failure**: the local node catches up by purging locally, then syncs |
 | `last_purge_instant` — peer is older than ours | **not a failure**: the peer catches up on its side; the local node says so in the handshake |
 | peer requests a column outside its profile | `COLUMN_NOT_PERMITTED` |
@@ -136,6 +139,12 @@ session proceeds. This is a routine, recoverable condition.
 tombstone has been purged, and nothing can order those two rows. It must re-seed. The
 check is mesh-wide, not per-link — see [lifecycle.md](lifecycle.md) § "The staleness
 rule".
+
+**Staleness is symmetric.** The rule refuses a stale peer as a *destination*, and also
+as a *source*: a session with a stale peer is pull-only, and the stale peer's pushes
+are refused with `STALE_PEER`. A peer that was away longer than the tombstone evidence
+lasts cannot tell a row that was deleted and purged while it was away from one that was
+merely old, so its rows are not accepted.
 
 ### The authenticated identity
 
@@ -178,9 +187,9 @@ part of the join bundle: a node that has never synced has no ranges at all, and 
 decide whether a row's identifier belongs to a site it has not heard of.
 
 The phase is a normal table sync — the same SUMMARY/DETAIL/ROWS machinery, over the
-`sites` table — run first, and it runs unconditionally at the start of a session, even
-when the registry itself has not changed. A session that omits it would accept rows whose
-owners it does not know, which the range trigger defers rather than rejects.
+`sites` table — run first, and it runs at the start of every session, even when the
+registry itself has not changed. A session that omits it would accept rows whose owners
+it does not know, which the range trigger defers rather than rejects.
 
 **The phase is conditional.** A deployment that brings its own identifier scheme sets
 `registry.enabled = false` in the handshake; there is then no registry table, no `site`
@@ -259,7 +268,8 @@ Every ROWS batch carries the **origin** of the rows it contains:
 ```jsonc
 { "session_id": "…", "tbl": "device", "mode": "digest",
   "origin": { "node_id": "…", "role": "child", "site": "eu-west" },
-  "cursor": { "bucket_id": 29681, "level": "hour", "last_key": "…" },
+  "cursor": { "tbl": "device", "bucket_id": 29681, "level": "hour",
+              "last_key": "…", "as_of_us": … },
   "rows": [ … ] }
 ```
 
@@ -267,6 +277,10 @@ The origin is **the node that wrote the rows**, not the node sending them. A mas
 rows travel master → master → child, and the child's write authority must still be
 evaluated against the master that wrote them. See
 [data-model.md](data-model.md) § "Write authority".
+
+The cursor in a request is the same shape as the `next_cursor` a response returns. It
+carries the `as_of_us` it was issued at, because a cursor from a different comparison
+depth is not usable — the session would be comparing against a different snapshot.
 
 ### Paging and message budgets
 
@@ -276,11 +290,16 @@ would exceed `max_message_bytes` (default 4 MiB) and returns a cursor instead:
 ```jsonc
 // response
 { "session_id": "…",
+  "origin": { "node_id": "…", "role": "child", "site": "eu-west" },
   "rows": [ … ],
   "next_cursor": { "tbl": "device", "bucket_id": 29681, "level": "hour",
                    "last_key": "…", "as_of_us": … },
   "done": false }
 ```
+
+The response carries the origin too, because the response is where the rows are: a
+receiver evaluates write authority against the rows it is about to apply, and it cannot
+do that without knowing who wrote them.
 
 The cursor is **deterministic and resumable**: it names the bucket, the last key sent
 within it, and the `as_of_us` the session is running at. Rows within a bucket are
@@ -399,8 +418,10 @@ rather than advice:
    that every peer computes identically, which in practice means doing it before the
    rows are sent.
 
-The digest tie-break remains the fallback: a policy that returns "undecided" falls
-through to LWW on `(last_update, digest)`.
+The digest tie-break remains the fallback: a policy that returns `Undecided` falls
+through to LWW on `(last_update, digest)`. The fallback covers a policy that **cannot
+decide**; it does not cover one that decides wrongly. A non-convergent policy returns a
+definite decision, so the tie-break never fires and the crate cannot detect it.
 
 See [data-model.md](data-model.md) § "Merge policies" and
 [adr/0015](adr/0015-per-table-merge-policies-and-write-authority.md).
@@ -440,6 +461,12 @@ of tables with tombstones due:
 due = SELECT DISTINCT tbl FROM _sync_log
       WHERE purge_on_us IS NOT NULL AND purge_on_us <= T
 ```
+
+In steady state this selects exactly the rows with `purge_on_us = T`, because the
+earlier deadlines were purged at their own instants. The `<=` is what lets a node that
+**missed** an instant catch up: its backlog counts as due, and is purged rather than
+orphaned at a deadline that will never come round again. The same predicate is used for
+the purge itself.
 
 - If `due` is empty, the purge is a no-op and the node **does not quiesce at all**.
 - If `due` is not empty, only those tables refuse sync; a session about another table
@@ -526,8 +553,10 @@ A peer that has fallen out of the retention window must be re-seeded wholesale. 
 the case a human actually waits on, so it gets its own progress path: "row N of M", where
 M is the table's row count from `SELECT count(*)` at the start.
 
-A re-seed is a **merge, not a wipe** — the stale peer pushes its unsynced local rows
-first, then pulls the peer's dataset, and keeps the rows the peer does not have. See
+A re-seed is a **wipe** — the stale peer discards its synced state and pulls the peer's
+dataset. It does not push: its unsynced writes are discarded, because a peer that was
+away longer than the tombstone evidence lasts cannot tell a row that was deleted and
+purged while it was away from one that was merely old. See
 [lifecycle.md](lifecycle.md) § "What a re-seed does".
 
 ### Persistence
@@ -649,7 +678,8 @@ stable string; the numeric value is an implementation detail.
 | `UNKNOWN_PEER` | The presented UUID is not in the directory | Not provisioned, or revoked |
 | `IDENTITY_MISMATCH` | The claimed UUID is not the identity the transport authenticated | A peer claiming another node's UUID |
 | `BAD_CREDENTIAL` | The credential does not verify for the claimed role | Wrong secret, or a rotated one |
-| `STALE_PEER` | The peer is older than the staleness horizon | The peer has been offline longer than the retention window and must re-seed |
+| `STALE_PEER` | The peer is older than the staleness horizon | The peer has been offline longer than the retention window and must re-seed; the session is pull-only in both directions |
+| `PURGE_SCHEDULE_MISMATCH` | The purge schedule differs — `purge_period_us` or `purge_offset_us` | The deployment was provisioned inconsistently; the peers would purge different sets |
 
 Every one of these is a **correctness** failure, not a policy difference: continuing
 would mean comparing trees that cannot be compared, or accepting writes from a node that
