@@ -128,20 +128,22 @@ which is the point of specifying the encodings precisely.
 
 ## Open questions
 
-These are unresolved, and the ones marked **blocking** hold up a specific crate.
+Most of these are resolved, and a resolved row stays in the table so the reasoning is
+still findable. The ones that are not are the ones marked **blocking**, and they hold up
+a specific crate.
 
 | # | Question | Impact | Blocking |
 |---|---|---|---|
-| 1 | **Default write dialect.** Enforced (UDF triggers) or compatible (pure-SQL staging)? | Determines whether the application can use `Db::conn()` at all | [core](plan/core.md) C1 |
+| 1 | **Can the target application take its connections from the crate?** The *default* dialect is settled — `Enforced`, with `Compatible` as the fallback — but the choice is a deployment fact, not a design fact. See § "Question 1, elaborated" | Determines whether the write-time invariants can be enforced at all | [core](plan/core.md) C1 |
 | 2 | ~~Does the crate terminate TLS?~~ | **Resolved: no.** The crate has no TLS dependency. The application terminates TLS and handles authentication; the crate provides the exchange and the peer check. See [doc/implementation.md](doc/implementation.md) | — |
 | 3 | ~~`GlobalId` or `SiteNamespaced` as the default key strategy?~~ | **Resolved: `GlobalId` default.** The sites share one dataset, so the same user is the same user. `SiteNamespaced` remains available per table for genuinely per-site data. See [ADR-0006](doc/adr/0006-site-namespaced-keys.md) | — |
 | 4 | **How is the digest seed distributed?** Environment variable, mounted secret, or KMS. The crate holds it in memory and **never writes it to the database**; it implements no secret store and no rotation. See Q16 and [ADR-0020](doc/adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md) | Deployment; not implementation | — |
 | 5 | ~~Wire format. JSON, or binary from the start?~~ | **Resolved: JSON**, wire version `merkle-lww/1`. Rows are positional arrays over the projection's column list. **Compression is not part of the protocol** — it is a transport-level content encoding, and `merkle-lww-axum` enables zstd level 1 by default. The wire format is outside `schema_hash` and outside the digest, so changing it re-digests nothing. See [ADR-0023](doc/adr/0023-json-wire-format-and-transport-compression.md) | — |
 | 6 | ~~Is the purge period daily, or aligned to the retention window?~~ | **Resolved: daily.** The purge instant is every 24 h, at a deployment-wide offset within the period. The cadence only decides how soon a tombstone is collected; with a 30-day retention a tombstone lives 30–31 days. It does not interact with the purge floor, which applies to tombstones only. See [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md) and [doc/lifecycle.md](doc/lifecycle.md) | — |
-| 7 | **Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?** Only staged rows, presumably, but a row written and deleted within one interval is lost — acceptable, since it was never visible to a peer. | Drain semantics | [core](plan/core.md) C1 |
-| 8 | **Should `AppendOnly` tables exist?** They remove the delete machinery from the trigger set, at the cost of a second code path. | Scope of the trigger set | [core](plan/core.md) C1 |
+| 7 | ~~Does the compatible dialect's drainer compute digests for the whole table or only for staged rows?~~ | **Resolved: only staged rows.** A row written and deleted within one interval is lost, which is acceptable because it was never visible to a peer. The drainer also normalises `purge_on` to the instant its window implies, so the uniform-per-window rule holds even in compatible mode. See [doc/sqlite-interface.md](doc/sqlite-interface.md) § "Compatible mode and foreign connections" | — |
+| 8 | ~~Should `AppendOnly` tables exist?~~ | **Resolved: yes.** `TableKind::AppendOnly` is a per-table declaration that removes the soft-delete machinery from the trigger set, at the cost of a second code path. It is not the default; `Keyed` is. See [doc/config.md](doc/config.md) § "Table specification" | — |
 | 9 | ~~Should the crate manage the `sync_id` column, or use the application's own key?~~ | **Resolved: the application's own key.** The application's `userid` is already globally unique and never reused, so it *is* the sync key and no extra column is needed. `Derived` covers applications whose key is local or mutable. See [ADR-0012](doc/adr/0012-sync-key-is-the-applications-key.md) | — |
-| 10 | **How is the derivation namespace chosen?** A per-table constant from the table name and `epoch_us` keeps ids stable within a deployment but differs between deployments. | Id stability | [model](plan/model.md) M2 |
+| 10 | ~~How is the derivation namespace chosen?~~ | **Resolved: explicitly, or derived.** `KeyStrategy::Derived` carries a `namespace`. `None` means the crate derives it per table from the table name and `epoch_us` — stable within a deployment, different between deployments, which is enough for the expected shape. An application that needs ids stable across deployments sets it explicitly. See [doc/data-model.md](doc/data-model.md) § "Key strategies" | — |
 | 11 | ~~Should the crate own the id allocator?~~ | **Resolved: it may, and it is optional.** The crate offers the allocator and the range registry behind the `alloc` feature; a deployment that brings its own identifier scheme has neither. Owning it makes the "never reused" property a guarantee rather than a convention. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
 | 12 | **Should the crate offer a membership-table helper?** Materialising a JSON array into a child table removes a recurring source of merge bugs. | API scope | [cli](plan/cli.md) X1 |
 | 13 | ~~Who assigns the site ranges, and how?~~ | **Resolved: the deployment does, and the crate enforces locally.** Central assignment plus local enforcement; the crate cannot prevent two nodes from concurrently creating sites with overlapping ranges, because each check passes locally and the merge happens afterwards. Where the crate's own allocator is used, it is the allocator that assigns the ranges. It is a deployment invariant. See [ADR-0019](doc/adr/0019-the-allocation-registry-is-optional.md) | — |
@@ -157,8 +159,8 @@ These are unresolved, and the ones marked **blocking** hold up a specific crate.
 | 23 | ~~Can an application keep its own write path?~~ | **Resolved.** `Db::register_on(&Connection)` installs the UDFs and the authorizer on a caller-owned connection. See [doc/sqlite-interface.md](doc/sqlite-interface.md) | — |
 | 24 | ~~Is the purge instant fixed, and is `purge_on` per row?~~ | **Resolved.** `purge_on` is computed from the delete's window — the interval between two consecutive purge instants — so every tombstone in a window shares one deadline, and the tombstone lives at least `retention`. The instant carries a deployment-wide `purge_offset_us`, so a deployment can choose when in the period the purge falls. See [ADR-0022](doc/adr/0022-one-purge-instant-per-window.md) | — |
 | 25 | ~~What does a visibility profile do to the digest?~~ | **Resolved: nothing.** The digest's input is always the full replicated column set. A peer that cannot see a column receives the digest verbatim and never recomputes it, and the tree is unaffected because `row_hash` is a function of the digest. See [ADR-0016](doc/adr/0016-visibility-profiles-mapped-to-peer-roles.md) | — |
-| 26 | **Is the JSON the public contract, or the Rust API?** The golden wire vectors imply the JSON is frozen and the Rust types are a serialisation of it. If the Rust types are the contract, the JSON can change freely and the vectors are only a convenience. The two readings give different answers to "may I add a field to `Hello`?" — and to whether a Rust consumer and a non-Rust consumer are held to the same shape. | The wire format's evolution policy | [protocol](plan/protocol.md) P1 |
-| 27 | **Should `merkle-lww-model` be published separately, or re-exported through `merkle-lww-core`?** An application that configures the crate and implements a merge policy needs the types either way. Re-exporting keeps the dependency list at one crate; publishing separately makes the compatibility surface a first-class artifact that another language's implementation can be checked against. | The public API shape | [model](plan/model.md) M1 |
+| 26 | ~~Is the JSON the public contract, or the Rust API?~~ | **Resolved: the JSON is the contract.** [doc/protocol.md](doc/protocol.md) § "Message encoding" is normative, the wire version is `merkle-lww/1`, and the wire vectors are published and stable. The Rust types are a serialisation of it, not the other way round — which is what lets a second implementation in another language be checked against the same bytes | — |
+| 27 | ~~Should `merkle-lww-model` be published separately, or re-exported through `merkle-lww-core`?~~ | **Resolved: both.** It is published separately, because the compatibility surface — the digest, the schema hash, the visibility hash — is a first-class artifact that another language's implementation is checked against. And it is re-exported through `merkle-lww-core`, so an ordinary application depends on one crate rather than two | — |
 
 Question 1 changes the shape of the code. The rest can be settled during the crate they
 affect.
@@ -198,9 +200,12 @@ mode a foreign connection has no denial rules. It can write `_sync_log` and hard
 managed rows. Two pure-SQL guards close the important cases: a `BEFORE DELETE` trigger
 converts a hard delete into a soft delete, and a guard trigger rejects writes to the
 internal log. The remaining gap is that a foreign connection can write `status` or
-`purge_on` directly. That is caught and propagated, but the tombstone deadline may be
-inconsistent. See [doc/sqlite-interface.md](doc/sqlite-interface.md) § "Compatible mode and
-foreign connections".
+`purge_on` directly. The deadline is **not** part of the gap — the drainer normalises
+`purge_on` to the instant its window implies, so the uniform-per-window rule holds even
+in compatible mode — but the *timing* of the delete can differ, so a tombstone can be
+created earlier than the engine would have created it. See
+[doc/sqlite-interface.md](doc/sqlite-interface.md) § "Compatible mode and foreign
+connections".
 
 **Recommendation.** Default to **enforced**, and document that the application must use
 `Db::conn()` or the crate's connection factory. The failure mode for a misconfigured

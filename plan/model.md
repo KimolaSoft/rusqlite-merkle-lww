@@ -94,7 +94,10 @@ Everything here is `serde`-derived with `Default`.
 
 - **One rule for keys and values.** The key encoding is the value encoding applied to
   each key column, in registered order. `userid = 10001` therefore produces the same
-  tagged bytes in `_sync_log.k`, in the digest input, and on the wire.
+  tagged bytes in `_sync_log.k` and in the digest input. The **key** is carried on the
+  wire in exactly those bytes; the row's **values** travel in the wire's own tagged
+  JSON form, which distinguishes the same five storage classes in a form a JSON parser
+  can read. See [protocol.md](../doc/protocol.md) § "Message encoding".
 - **The digest is keyed.** The seed never leaves the process, so a client cannot
   recompute a digest and cannot brute-force one from a low-entropy value.
 - **`row_hash` is two-level**: the digest of the row, and the hash of the digest. The
@@ -109,8 +112,8 @@ Everything here is `serde`-derived with `Default`.
 - The encoding is injective on a generated set of values: two distinct rows never encode
   to the same bytes (`proptest`).
 - **The key encoding is the value encoding**: `userid = 10001` produces the same tagged
-  bytes in `_sync_log.k`, in the digest input, and on the wire — and the same rule
-  covers a composite key.
+  bytes in `_sync_log.k` and in the digest input — and the key is carried on the wire
+  in exactly those bytes. The same rule covers a composite key.
 - **The derived sync id is deterministic**: the same identity columns produce the same
   id on every node, and different identity columns produce different ids.
 
@@ -208,5 +211,9 @@ in the loop is [core's](core.md) responsibility.
   consume.
 - The public API is documented, because it is now published surface: a change to
   `SyncConfig`, `MergePolicyFn` or the encoding is a breaking change.
+- **The crate is published separately, and re-exported through `merkle-lww-core`.**
+  Published separately, because the compatibility surface is a first-class artifact that
+  another language's implementation is checked against; re-exported, so an ordinary
+  application depends on one crate rather than two.
 
 **Test suites:** 14, plus the `schema_hash` and `visibility_hash` checks.

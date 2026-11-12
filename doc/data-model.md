@@ -201,6 +201,14 @@ pub enum KeyStrategy {
         identity_columns: Vec<String>,
         /// Optional prefix distinguishing entity kinds within a table.
         prefix: Option<String>,
+        /// The UUIDv5 namespace the derivation runs in.
+        ///
+        /// `None` means the crate derives it, per table, from the table name and
+        /// `epoch_us`. That is stable **within a deployment** — every peer computes
+        /// the same namespace — and differs **between** deployments, because the
+        /// epoch differs. Set it explicitly if the ids must be stable across
+        /// deployments too.
+        namespace: Option<Uuid>,
     },
 
     /// Owner-namespaced: the row's site is part of the key, so two sites never
@@ -287,7 +295,7 @@ sync key changes, and that is a **move** rather than an update.
 
 A `users` table whose identity is `email` therefore treats an email change as a move. A
 `users` table whose identity is a stable surrogate treats it as an update. See
-[examples.md](examples.md) § "Deriving the sync key".
+[examples.md](examples.md) § "`email` is mutable, and that is fine".
 
 ### Keys are immutable
 
@@ -306,8 +314,16 @@ primary key of `_sync_log`. Under `SiteNamespaced` the encoding includes the nam
 
 The rule is one rule: **the key encoding is the value encoding, applied to each key
 column in registered order.** `userid = 10001` encodes as a tagged INTEGER value, and the
-same bytes appear in `_sync_log.k`, in the digest input, and on the wire. There is no
-separate key format to keep in step.
+same bytes appear in `_sync_log.k` and in the digest input. There is no separate key
+format to keep in step.
+
+On the wire, the **key** is those canonical bytes, carried as base64 — so the key is
+byte-identical everywhere. The **values** are not: the wire carries them in the JSON
+tagged form described in [protocol.md](protocol.md) § "Message encoding", which
+distinguishes the same five storage classes but in a form a JSON parser can read. The two
+encodings agree on the *type* of every value, which is what the digest depends on; they
+differ in representation, because one is a binary digest input and the other is a wire
+message.
 
 ## Column specifications
 
@@ -899,7 +915,9 @@ special cases:
 
 So `userid = 10001` encodes as `01 08 00 00 00 11 27 00 00 00 00 00 00` — tag `1`,
 length `8`, then the `i64` little-endian. The same rule produces the bytes for
-`_sync_log.k`, for the digest input, and for the wire.
+`_sync_log.k` and for the digest input, and the key is carried on the wire in exactly
+those bytes. The row's *values* travel in the wire's own tagged JSON form — see
+[protocol.md](protocol.md) § "Message encoding".
 
 Using the **runtime** type rather than the declared SQL type is deliberate: the tag
 distinguishes `INTEGER 1` from `TEXT "1"`, so two peers that disagree about a value's

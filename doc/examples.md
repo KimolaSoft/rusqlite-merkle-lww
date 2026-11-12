@@ -402,11 +402,21 @@ catches up. See § "The range check can be enforced by the engine".
 
 ### Who assigns the ranges?
 
-Not the crate. Two nodes creating sites concurrently can each accept a range that overlaps
-the other's, because each check passes locally and the merge happens afterwards. Range
-allocation is an administrative act — an operator, or a small allocation service, assigns
-ranges and seeds them identically on every node. The registry then replicates as ordinary
-data.
+**Both answers are available, and the crate offers one of them.**
+
+By default, **not the crate**: range allocation is an administrative act — an operator,
+or a small allocation service, assigns ranges and seeds them identically on every node.
+The registry then replicates as ordinary data. Two nodes creating sites concurrently can
+each accept a range that overlaps the other's, because each check passes locally and the
+merge happens afterwards; that is a property of the scheme, not of the implementation.
+
+**Where the crate's own allocator is used, it is the allocator that assigns the
+ranges.** The crate offers `IdAllocator` behind the optional `alloc` feature: it owns the
+range table and the durable counter, so the "never reused" property is guaranteed by the
+crate rather than by convention, and the range assignment is serialised through the
+allocator rather than left to two nodes racing. A deployment that brings its own
+identifier scheme has neither the allocator nor the registry. See
+[ADR-0019](adr/0019-the-allocation-registry-is-optional.md).
 
 A simpler variant exists: derive the range from the site id (`uid_start = site_id * width`),
 which makes overlap impossible by construction. It fixes the range width and still needs a
@@ -504,22 +514,30 @@ Everything above was checked against rusqlite 0.41.1 with bundled SQLite 3.54.1.
 
 ## Open questions these examples raise
 
-1. **Which range scheme?** Site prefix (`site_id * 10000 + n`) is simpler; explicit
-   allocation is more flexible. See § "Allocating locally, and never reusing".
+Three of these are settled in the plan; the rest are still open.
+
+1. ~~**Which range scheme?**~~ **Settled:** explicit allocation, seeded identically on
+   every node, with the crate's own allocator available behind the `alloc` feature for
+   deployments that want the "never reused" property guaranteed rather than conventional.
+   See § "Allocating locally, and never reusing".
 2. **Is `groups` a group definition or a membership table?** One row per group (the
    schema as given) means `access_level` is the group default and `email` is a contact.
    Per-member permissions would need `PRIMARY KEY ("group", email)`.
 3. **Are group names global or per-site?** With globally unique `userid`s, global is
    consistent. A per-site namespace would need `(site, name)` and a `site` column.
-4. **Should the crate manage the allocator?** It could provide `IdAllocator` that owns the
-   range table and the durable counter, so the "never reused" property is guaranteed by
-   the crate rather than by convention.
+4. ~~**Should the crate manage the allocator?**~~ **Settled: it may, and it is
+   optional.** The crate offers `IdAllocator` behind the `alloc` feature, so the "never
+   reused" property is guaranteed by the crate rather than by convention. A deployment
+   that brings its own identifier scheme has neither. See
+   [ADR-0019](adr/0019-the-allocation-registry-is-optional.md).
 5. **Should the crate offer a membership-table helper?** Given how common
    "entity has a set of things" is, a helper that materialises a JSON array into a child
    table would remove a recurring source of merge bugs.
-6. **Who assigns ranges, and how?** The crate cannot prevent two nodes from concurrently
-   creating sites with overlapping ranges. Central assignment plus local enforcement is
-   the current answer; a crate-side allocator is a possible extension.
+6. ~~**Who assigns ranges, and how?**~~ **Settled: the deployment does, and the crate
+   enforces locally.** Central assignment plus local enforcement; the crate cannot prevent
+   two nodes from concurrently creating sites with overlapping ranges, because each check
+   passes locally and the merge happens afterwards. Where the crate's own allocator is
+   used, it is the allocator that assigns the ranges.
 7. **Should `site_id` be an opaque id or a readable slug?** A slug is nicer to read and
    awkward to keep immutable; an opaque id is the reverse. The `sites` table is the
    application schema, so this is the application's choice — but the crate must not
@@ -532,5 +550,5 @@ Everything above was checked against rusqlite 0.41.1 with bundled SQLite 3.54.1.
 - [bulk-apply.md](bulk-apply.md) — applying many rows at once
 - [sqlite-interface.md](sqlite-interface.md) — the trigger set
 - [adr/0019-the-allocation-registry-is-optional.md](adr/0019-the-allocation-registry-is-optional.md) — the registry decision
-- [adr/0019-the-allocation-registry-is-optional.md](adr/0019-the-allocation-registry-is-optional.md) — the registry is optional
-- [../PLAN.md](../PLAN.md) — where the allocator and column-locality work lands
+- [../PLAN.md](../PLAN.md) — the open questions and the risks
+- [../plan/core.md](../plan/core.md) — where the allocator and column-locality work lands

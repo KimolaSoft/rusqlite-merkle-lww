@@ -487,10 +487,10 @@ The crate owns DDL for managed tables, because it owns their triggers, their man
 columns, and their indexes. The application owns DDL for everything else.
 
 ```rust
-store.create_table(&spec)?;        // creates with managed columns and triggers
-store.alter_table(&spec)?;         // adds missing managed columns
-store.adopt_table(&spec)?;         // registers an existing table, adding managed columns
-store.drop_table("device")?;
+db.create_table(&spec)?;        // creates with managed columns and triggers
+db.alter_table(&spec)?;         // adds missing managed columns
+db.adopt_table(&spec)?;         // registers an existing table, adding managed columns
+db.drop_table("device")?;
 ```
 
 Every DDL path must also reinstall the triggers and rebuild the tree, since a dropped or

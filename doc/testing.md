@@ -16,7 +16,7 @@ Everything else in this document exists to support it.
 
 ### 1. Convergence
 
-- Three nodes, random operations, random partitions and heals.
+- **Two nodes and three nodes**, random operations, random partitions and heals.
 - Assert identical tree hashes across all nodes.
 - Assert identical `_sync_log` contents across all nodes.
 - Include moves (`move_key`) and un-deletes in the operation set.
@@ -116,7 +116,11 @@ documentation rather than silently changing the contract.
 ### 7. Clock skew
 
 - Inject ±5 s skew — the default `max_skew`. Assert convergence is unaffected.
-- Inject a skew beyond `max_skew`. Assert the peer is refused.
+- Inject a skew beyond `max_skew`. Assert the peer is refused with **`CLOCK_SKEW`**.
+- **The `as_of_us` tolerance is not a skew check.** Two peers choosing a comparison
+  depth more than `as_of_tolerance` apart is **not** an error: the server's depth wins
+  and the client adopts it. Assert that the session continues, and that the client
+  reports having adopted the server's depth.
 - Assert the monotonic issuance guard prevents a backwards clock from regressing a row:
   a write after a clock step still gets a `last_update` greater than the previous one.
 
@@ -135,7 +139,9 @@ documentation rather than silently changing the contract.
 - Run a full sync to a client and assert that no `Restricted` column value appears
   anywhere in the wire bytes, in any log line, or in any error message. **This test must
   never regress.**
-- Assert a client requesting a restricted column is rejected.
+- Assert a client requesting a restricted column is refused with
+  `COLUMN_NOT_PERMITTED`, and that the refusal is **not** fatal: the column is dropped
+  from the projection, the request is logged, and the session continues.
 - Assert a table excluded by the client's profile is absent from the client's handshake.
 - Assert the client cannot recompute a digest, and that a brute-force over a
   low-entropy restricted value does not produce a matching bucket hash.
@@ -186,8 +192,9 @@ language can implement the same format.
 
 - REST: `tower::ServiceExt::oneshot`.
 - WebSocket: a real client against a real server.
-- Handshake rejection cases: epoch mismatch, seed mismatch, unknown peer, stale peer,
-  restricted column request.
+- Handshake rejection cases: epoch mismatch, seed mismatch, unknown peer, stale peer.
+  **Not** a restricted-column request — that one is refused without ending the session,
+  and it is asserted in Suite 10.
 
 ### 16. Bulk apply
 

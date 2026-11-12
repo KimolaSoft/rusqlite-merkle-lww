@@ -148,6 +148,8 @@ always fewer, so the wire is never the binding constraint.
   "schema_hash": "…",
   "visibility_hash": "…",
   "codec_version": 1,
+  "seed_verifier": "…",       // a verifier over the digest seed — never the seed
+  "credential": "…",           // the credential the peer presents for its role
   "directory": [ { "node_id": "…", "role": "master" },
                  { "node_id": "…", "role": "child",
                    "parent_id": "…" } ]
@@ -193,6 +195,31 @@ is the child security boundary, and the handshake is where it is withheld.
 
 A client sends no directory and receives none.
 
+### The seed verifier
+
+**The digest seed is never sent.** It is a secret, and a peer that has it can compute
+every digest. But the handshake has to be able to detect that two peers hold
+*different* seeds, because different seeds mean different digests for the same row and
+the trees will never converge.
+
+The handshake carries a **verifier** instead: a keyed derivation of the seed that two
+holders of the same seed compute identically and that does not disclose the seed. Two
+verifiers that differ mean two seeds that differ, and the session is refused with
+`DIGEST_SEED_MISMATCH`. A verifier that *matches* proves nothing on its own — it is a
+consistency check, not an authentication — which is why it is only ever compared
+between **trusted peers**, and why a client is never asked for one.
+
+**The credential is presented in the handshake**, and it is the role string: the master
+string, or the child string. A child holds only the child string, and a master holds
+both. It is checked against the role the peer claims, and a peer that cannot verify for
+its claimed role is refused with `BAD_CREDENTIAL`.
+
+**The authenticated identity is not on the wire.** It comes from the transport — the
+application tells the crate who it authenticated — and the crate binds it to the
+`node_id` the peer claimed. A peer whose claimed `node_id` is not the identity the
+transport authenticated is refused with `IDENTITY_MISMATCH`. See
+[ADR-0020](adr/0020-application-authenticated-peer-identity-and-optional-per-node-credentials.md).
+
 ### Validation
 
 | Check | Failure |
@@ -200,18 +227,19 @@ A client sends no directory and receives none.
 | `epoch_us` differs | `EPOCH_MISMATCH` — fatal; the trees are not comparable |
 | `protocol` differs | `PROTOCOL_UNSUPPORTED` |
 | `codec_version` differs | `CODEC_MISMATCH` — fatal; the encoding changed, so every digest changed |
-| `digest_seed` differs (trusted peers) | `DIGEST_SEED_MISMATCH` — fatal; every row hash differs |
+| `seed_verifier` differs (trusted peers) | `DIGEST_SEED_MISMATCH` — fatal; every row hash differs. The seed itself is never sent — see § "The seed verifier" |
 | `schema_hash` differs (trusted peers) | `SCHEMA_MISMATCH` — fatal; the digest inputs differ |
 | `visibility_hash` differs (trusted peers) | `VISIBILITY_MISMATCH` — fatal; the profiles differ, so the peers project the data differently |
 | `node_id` not in the directory | `UNKNOWN_PEER` |
 | `node_id` differs from the application's authenticated identity | `IDENTITY_MISMATCH` — fatal; the peer is not who the transport says it is |
 | credential does not verify for the claimed role | `BAD_CREDENTIAL` |
-| `as_of_us` differs by more than the tolerance | the server's wins; the client adopts it |
+| **clock skew** beyond `max_skew` | `CLOCK_SKEW` — **the peer is refused**; the two nodes cannot agree on what time it is, and every timestamp they exchange would be suspect |
+| `as_of_us` differs by more than `as_of_tolerance` | **not a failure**: the server's wins; the client adopts it and reports that it did. This is the session's *comparison depth*, not a clock reading — the two sides are choosing where to compare, not disagreeing about when it is |
 | `last_sync_us` — peer is older than the staleness horizon | `STALE_PEER` — the peer must re-seed, and the session is **pull-only** (see [lifecycle.md](lifecycle.md)) |
 | `retention_us`, `purge_period_us` or `purge_offset_us` differs | `PURGE_SCHEDULE_MISMATCH` — fatal; the peers would purge different sets at different moments |
 | `last_purge_instant` — peer is newer than ours | **not a failure**: the local node catches up by purging locally, then syncs |
 | `last_purge_instant` — peer is older than ours | **not a failure**: the peer catches up on its side; the local node says so in the handshake |
-| peer requests a column outside its profile | `COLUMN_NOT_PERMITTED` |
+| peer requests a column outside its profile | `COLUMN_NOT_PERMITTED` — **the request is refused, not the session.** The column is dropped from the projection and the request is logged; the session continues |
 | unknown `tables`/`columns`, **client** session | sync the intersection, log a warning |
 | unknown `tables`/`columns`, **trusted peer** | `SCHEMA_MISMATCH` — fatal |
 
@@ -221,6 +249,23 @@ intersection is the right behaviour. A **trusted peer** that disagrees about the
 replicated column set would compute different digests for the same logical row, and the
 trees would never converge. That is not a warning; it is fatal. The `schema_hash` is
 what makes the difference detectable.
+
+**`COLUMN_NOT_PERMITTED` is not fatal.** A peer asking for a column it is not allowed
+to see is a mistake, not an attack: the projection is the server's to decide, and the
+request is refused by dropping the column and logging it. The session continues, because
+there is a well-defined projection to carry on with. `EPOCH_MISMATCH`,
+`SCHEMA_MISMATCH`, `VISIBILITY_MISMATCH`, `DIGEST_SEED_MISMATCH` and
+`PURGE_SCHEDULE_MISMATCH` are fatal precisely because there is **no** well-defined way
+to continue: the two sides would compute different digests for the same row, or purge
+different sets.
+
+**Two different tolerances, and they are not the same knob.** `max_skew` is about the
+*clock*: if two nodes disagree about what time it is by more than the tolerance, the
+peer is refused with `CLOCK_SKEW`, because every timestamp either side stamps would be
+suspect. `as_of_tolerance` is about the *comparison depth*: it decides how deep the two
+sides compare, and the server simply wins. Adopting the server's depth is correct and
+costs nothing; refusing a peer whose clock is off is necessary, because there is no
+negotiation that fixes it.
 
 `as_of_us` is the single timestamp driving the comparison-depth policy and the "what
 changed since" computation. In a client→server session the server supplies it, so both
@@ -788,10 +833,18 @@ stable string; the numeric value is an implementation detail.
 | `BAD_CREDENTIAL` | The credential does not verify for the claimed role | Wrong secret, or a rotated one |
 | `STALE_PEER` | The peer is older than the staleness horizon | The peer has been offline longer than the retention window and must re-seed; the session is pull-only in both directions |
 | `PURGE_SCHEDULE_MISMATCH` | The purge schedule differs — `retention_us`, `purge_period_us` or `purge_offset_us` | The deployment was provisioned inconsistently; the peers would purge different sets |
+| `CLOCK_SKEW` | The peer's clock is more than `max_skew` away | One node's clock drifted, or NTP is not running; every timestamp either side stamps would be suspect |
 
 Every one of these is a **correctness** failure, not a policy difference: continuing
 would mean comparing trees that cannot be compared, or accepting writes from a node that
 should not be writing.
+
+**`CLOCK_SKEW` is a different kind of failure from the rest of this table.** The others
+say the two sides disagree about a *shared fact* — the epoch, the encoding, the schema.
+There is no negotiation that fixes that; the deployment must be made consistent.
+`CLOCK_SKEW` says the two sides disagree about *the time*, and the fix is operational:
+get the clocks right. It is fatal for the session and not for the deployment, which is
+why it is worth distinguishing from `EPOCH_MISMATCH` in an alert.
 
 **Missing a purge instant is not in this table.** A peer whose `last_purge_instant` is
 behind ours catches up by purging locally and the session continues. Only the retention

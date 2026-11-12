@@ -106,13 +106,27 @@ See [ADR-0023](../doc/adr/0023-json-wire-format-and-transport-compression.md) an
 
 - **The rules are pure.** `LocalView` is the set of facts the rules check: the epoch,
   the codec version, the schema hash, the visibility hash, the retention and purge
-  schedule, the known peers, and the last sync instant. `core` gathers it; the rules
-  do the checking. Every rejection case is therefore a table-driven test with no
-  database and no fixture.
+  schedule, the known peers, the last sync instant, **the digest seed verifier, the
+  expected credential, the transport-authenticated identity, and the skew tolerance**.
+  `core` gathers it; the rules do the checking. Every rejection case is therefore a
+  table-driven test with no database and no fixture.
+- **`LocalView` must carry everything the validation table checks.** A rule that needs
+  a fact the view does not carry is a rule that cannot be implemented as a pure
+  function — and the alternative, reaching for the database inside the rules, is what
+  this split exists to avoid.
+- **The digest seed is compared through a verifier, never sent.** The peer presents a
+  keyed derivation of the seed; two verifiers that differ mean two seeds that differ.
+  The verifier is a consistency check between trusted peers, not an authentication.
+- **The authenticated identity comes from the transport, not the wire.** The
+  application tells the crate who it authenticated, and the crate binds it to the
+  claimed `node_id`.
 - **This is where the fatal errors are raised**: `EPOCH_MISMATCH`, `PROTOCOL_UNSUPPORTED`,
   `CODEC_MISMATCH`, `DIGEST_SEED_MISMATCH`, `SCHEMA_MISMATCH`, `VISIBILITY_MISMATCH`,
   `UNKNOWN_PEER`, `IDENTITY_MISMATCH`, `BAD_CREDENTIAL`, `STALE_PEER`,
-  `PURGE_SCHEDULE_MISMATCH`, `COLUMN_NOT_PERMITTED`.
+  `PURGE_SCHEDULE_MISMATCH`, `CLOCK_SKEW`.
+- **`COLUMN_NOT_PERMITTED` is not among them.** A peer asking for a column outside its
+  profile is a mistake, not an attack: the column is dropped from the projection and
+  the request is logged, and the session continues.
 - **Two failure modes, two meanings.** A mismatch between two trusted peers is fatal;
   a client whose registration is narrower than the server's is not, and the server
   syncs the intersection and logs a warning. The distinction is in the rules, not in

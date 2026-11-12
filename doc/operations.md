@@ -55,6 +55,11 @@ anything.
 
 The crate exposes `clock_offset_estimate_us`, measured against peers at handshake, so a
 node can log its own skew and refuse peers it believes are more than `max_skew` away.
+It is also published as the `sync_clock_offset_estimate_us` gauge, so a drift is
+visible before it becomes a refusal.
+A peer refused on this ground is refused with **`CLOCK_SKEW`** — a fatal error for the
+session, but an **operational** fault rather than a deployment one: unlike
+`EPOCH_MISMATCH`, the configuration is fine and the clocks are not.
 
 ### TLS
 
@@ -138,6 +143,7 @@ The crate exposes counters and gauges for a Prometheus-style scrape:
 | `sync_log_rows` | gauge | Rows in `_sync_log` |
 | `sync_peer_last_sync_timestamp_seconds` | gauge | Per peer; last successful sync |
 | `sync_peer_stale` | gauge | Per peer; 1 if past the staleness horizon |
+| `sync_clock_offset_estimate_us` | gauge | Per peer; the estimated clock offset, measured at handshake. A value beyond `max_skew` is a `CLOCK_SKEW` waiting to happen |
 
 The two most useful in practice:
 
@@ -196,6 +202,24 @@ The deployment configuration has diverged. Fix the configuration on the odd node
 Note that changing `epoch_us` after data exists is not a fix — it re-buckets every row
 and invalidates every stored hash. The correct remedy is to make the configurations
 match again, and only then re-seed if the data has already diverged.
+
+### A peer is refused with `CLOCK_SKEW`
+
+**This one is operational, not a configuration problem.** The deployment's shared values
+— the epoch, the seed, the schema — are fine; one node's *clock* is more than
+`max_skew` away from the other's.
+
+The fix is on the node whose clock is off, not in the configuration:
+
+- Check that NTP or chrony is actually running on that host, and that it is not stuck.
+- Check `clock_offset_estimate_us` for the offending peer, and compare it with the
+  estimate the other node holds. The two numbers bracket the disagreement.
+- A host whose clock drifts *forward* is the more dangerous case: it stamps `last_update`
+  values ahead of its peers, and its writes will win the LWW comparison against writes
+  that actually happened later.
+
+A peer refused this way is not stale and does not need a re-seed. Fix the clock and the
+next session succeeds.
 
 ### Writes fail with "no such function: sync_stamp"
 

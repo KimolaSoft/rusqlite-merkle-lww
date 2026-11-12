@@ -32,6 +32,11 @@ apply a content encoding. See
   `POST /v1/sync/hello`, `/summary`, `/detail`, `/rows`, `/commit`.
 - The session registry: opaque `session_id`, in memory, five-minute idle TTL.
 - The handlers, built on `core`'s transport-agnostic exchange.
+- **The non-fatal refusals**, carried over the wire with their documented code:
+  `COLUMN_NOT_PERMITTED` — the column is dropped from the projection, the request is
+  logged, and the session continues; `TABLE_NOT_PERMITTED`; `WRITE_NOT_PERMITTED`;
+  `ROW_PURGED`; `SESSION_LIMIT`. A refusal that ends the session is a different thing
+  from a refusal that does not, and the transport has to be able to express both.
 
 ### Notes
 
@@ -136,6 +141,44 @@ apply a content encoding. See
   wire bytes.
 
 **Test suites:** 10, 15.
+
+---
+
+## A4 — Metrics and the health endpoint
+
+### Deliverables
+
+- The metrics from [operations.md](../doc/operations.md) § "Metrics" — the counters and
+  gauges a Prometheus-style scrape reads.
+- `GET /v1/health`, returning per-peer state: last successful sync, whether it is stale,
+  the current session and its progress, and whether the node is inside a purge quiesce
+  window.
+
+### Notes
+
+- **The crate owns the counters; the transport owns the endpoint.** The engine knows
+  what it compared, sent, applied and purged; the transport is what a scraper can
+  reach. The metrics are therefore produced in `merkle-lww-core` and exposed over
+  HTTP here.
+- **The diff ratio is the metric that matters.** `sync_buckets_differing_total` over
+  `sync_buckets_compared_total` is near zero in a healthy deployment, and a ratio that
+  climbs steadily means peers are diverging.
+- **`sync_peer_stale` is the one to alert on.** A peer creeping toward the staleness
+  horizon is about to require a re-seed, and a re-seed discards its unsynced writes.
+- **The health endpoint reads the same state the engine holds.** It does not poll the
+  peers, and it does not open a session.
+- `clock_offset_estimate_us` — the node's estimate of its peers' clock offsets — is
+  reported alongside, because a skew is the cause of a `CLOCK_SKEW` refusal and an
+  operator needs to see which peer is off.
+
+### Exit criteria
+
+- Every metric in [operations.md](../doc/operations.md) § "Metrics" is exposed, and the
+  names match the table exactly.
+- The health endpoint returns the per-peer state without opening a session, and without
+  touching a peer.
+- A metric counter is monotonic and a gauge is not — a counter that goes down is a bug,
+  and the test says so.
 
 ---
 

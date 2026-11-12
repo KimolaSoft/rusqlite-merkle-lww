@@ -212,4 +212,4 @@ enormous one — see [protocol.md](protocol.md) § "Paging and message budgets".
 - [protocol.md](protocol.md) — the ROWS phase that produces these batches
 - [merkle.md](merkle.md) — the digest tie-break referenced above
 - [sqlite-interface.md](sqlite-interface.md) — the trigger and authorizer layer
-- [../PLAN.md](../PLAN.md) — where bulk apply is implemented
+- [../plan/core.md](../plan/core.md) — where bulk apply is implemented

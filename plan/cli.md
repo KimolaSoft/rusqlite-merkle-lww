@@ -22,7 +22,8 @@ bugs are undebuggable without them. See
 ### Deliverables
 
 - `inspect`: the local state — the registered tables, the log's shape, the tree's
-  shape, the last purge instant, the peer list.
+  shape, the last purge instant, the peer list, and **the contents of a bucket**: which
+  keys, which `last_update`, which digest.
 - `tree`: the bucket tree, at a given level, with the hash of each bucket.
 - `verify`: the divergence report.
 
@@ -40,8 +41,8 @@ bugs are undebuggable without them. See
 
 ### Exit criteria
 
-- `verify` reports a divergence introduced by an out-of-band edit, and names the rows
-  and the bucket.
+- `verify` reports a divergence introduced by an out-of-band edit, and names the
+  **rows** whose stored digest disagrees with the tree.
 - `verify` reports **nothing** on a converged pair of databases — a tool that always
   finds something is not a diagnostic.
 - `tree` output at two levels is consistent: the parent hash is the fold of its

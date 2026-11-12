@@ -57,7 +57,8 @@ has already drifted.
 
 - Two peers exchange a full session in one process, with no ports and no network.
 - **A dropped, reordered and stalled message are each exercised**, and the session
-  either recovers or fails with the documented outcome.
+  either recovers or fails — and the outcome is asserted, so a change in it is a visible
+  diff rather than a surprise in production.
 - **Advancing the clock by 31 days crosses the staleness horizon**, and the next
   session is refused with `STALE_PEER` — with no wall-clock time passing.
 - The suite runs in under a second, and is not flaky across a hundred consecutive

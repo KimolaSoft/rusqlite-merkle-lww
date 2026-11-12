@@ -34,8 +34,8 @@ in the upsert itself.
 ### [examples.md](examples.md)
 
 Two worked example databases — a `users` table and a `groups` table — taken all the way
-through the design. They show why the sync key must be separate from the application's
-primary key, what a "local" column is, and why a JSON array column is not a value.
+through the design. They show why the sync key is usually the application's own key,
+what a "local" column is, and why a JSON array column is not a value.
 
 ### [sqlite-interface.md](sqlite-interface.md)
 

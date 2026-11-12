@@ -270,9 +270,10 @@ pub fn validate_handshake(local: &LocalView, peer: &Hello) -> Result<Hello>;
 ```
 
 `LocalView` is the set of facts the rules check — the epoch, the codec version, the two
-hashes, the retention and purge schedule, the known peers, the last sync instant.
-`core` gathers it from the database; the rules themselves need no database, so every
-rejection case is a table-driven test with no fixture.
+hashes, the retention and purge schedule, the known peers, the last sync instant, the
+digest seed verifier, the expected credential, the transport-authenticated identity and
+the skew tolerance. `core` gathers it from the database; the rules themselves need no
+database, so every rejection case is a table-driven test with no fixture.
 
 This crate also declares **the traits the session needs from the engine**, which `core`
 implements. The consumer declaring the interface is what keeps the dependency edge

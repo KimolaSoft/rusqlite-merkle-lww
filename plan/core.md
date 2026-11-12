@@ -46,6 +46,9 @@ SQLite behaviour that was verified experimentally rather than documented (see
 
 - `store.rs`: the `Db` type, the `r2d2` pool, the connection factory that registers
   UDFs and installs the authorizer, and `Db::conn()` / `Db::transaction()`.
+- The `Db` surface the application sees: `Db::open`, `Db::conn`, `Db::transaction`,
+  `Db::register_on`, `Db::with_privilege`, and the managed convenience layer —
+  `Db::upsert`, `Db::delete`, `Db::move_key`.
 - `Db::register_on(&rusqlite::Connection)`: install the UDFs and the authorizer on a
   **caller-owned** connection, so an application with an existing write path does not
   have to move its writes into the crate's pool. `Db::with_privilege(conn, f)` grants
@@ -349,12 +352,13 @@ SQLite behaviour that was verified experimentally rather than documented (see
 
 ---
 
-## C6 — The cache and the audit table
+## C6 — The cache, the audit table and the metrics
 
 ### Deliverables
 
 - `cache.rs`: the read-through cache, with the byte and entry bounds.
 - The optional `_sync_audit` table: which peer applied which row, locally.
+- The counters and gauges from [operations.md](../doc/operations.md) § "Metrics".
 
 ### Notes
 
@@ -362,11 +366,19 @@ SQLite behaviour that was verified experimentally rather than documented (see
   pretend otherwise.
 - **The audit table is off by default, node-local, and not in the digest** — turning it
   on cannot affect convergence.
+- **The engine owns the counters**, because the engine knows what it compared, sent,
+  applied and purged. The transport exposes them; see
+  [axum's A4](axum.md).
+- `clock_offset_estimate_us` is the node's estimate of its peers' clock offsets, and it
+  is what makes a `CLOCK_SKEW` refusal diagnosable.
 
 ### Exit criteria
 
 - The cache is bounded, and its bounds are enforced.
 - Turning the audit table on changes no digest and no tree.
+- Every metric in [operations.md](../doc/operations.md) § "Metrics" is produced by the
+  engine, and the names match that table exactly.
+- A counter is monotonic and a gauge is not.
 
 ---
 

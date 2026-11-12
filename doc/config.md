@@ -45,23 +45,35 @@ pub struct SyncConfig {
     pub credential: Option<SecretString>,
 
     // ---- visibility ----
-    // The named projections, and the role→profile mapping.
+    // The named projections, the role→profile mapping, and the peers this node
+    // serves or talks to.
     pub profiles:     Vec<VisibilityProfile>,
     pub role_profile: HashMap<Role, String>,
+    pub peers:        Vec<Peer>,
 
     // ---- local policy ----
     pub hot_window:    Duration,      // 24h
     pub warm_window:   Duration,      // 90d
     pub purge_quiesce: Duration,      // 60s
     pub max_skew:      Duration,      // 5s
+    pub as_of_tolerance: Duration,    // 1s
     pub max_message_bytes: usize,     // 4 MiB
     pub max_rounds_per_session: u32,  // 1000
+    pub max_tree_buckets: usize,      // 0 = no tripwire
     pub write_mode:    WriteMode,     // Enforced | Compatible
     pub audit:         bool,          // record attribution in _sync_audit
     pub cache:         CacheConfig,
     pub tables:        Vec<TableSpec>,
 }
 ```
+
+Three of these are **derived rather than configured**: `codec_version` is the crate's own
+encoding version, `schema_hash` is computed from the registered tables, and
+`visibility_hash` is computed from `profiles`. An application sets none of them
+directly; the crate computes them and puts them on the wire. They are listed here
+because a mismatch behaves exactly like a misconfigured shared value — it is detected at
+handshake and it is fatal — and an operator reading an alert needs to know that the fix
+is in the *registration* or the *profiles*, not in a shared configuration file.
 
 ### Secrets
 
@@ -96,6 +108,14 @@ rather than a policy difference. These are checked at handshake and a mismatch i
 | `codec_version` | The canonical encoding. A change re-digests every row | `CODEC_MISMATCH` |
 | `schema_hash` | Exactly the inputs to the row digest — see below | `SCHEMA_MISMATCH` |
 | `visibility_hash` | The visibility profile definitions — see below | `VISIBILITY_MISMATCH` |
+
+**Three of these are derived, not configured.** `codec_version` is the crate's own
+encoding version, `schema_hash` is computed from the registered tables, and
+`visibility_hash` is computed from `profiles`. An application sets none of them; the
+crate computes them and puts them on the wire. They are listed here because a mismatch
+behaves exactly like a misconfigured shared value — it is detected at handshake and it
+is fatal — and an operator reading an alert needs to know that the fix is in the
+*registration* or the *profiles*, not in a shared configuration file.
 
 ### What `schema_hash` covers
 
@@ -173,9 +193,11 @@ Everything else is local policy.
 | `hot_window` | 24 h | Ranges newer than this compare at hour depth |
 | `warm_window` | 90 d | Ranges newer than this compare at cycle depth; older compare at month depth |
 | `purge_quiesce` | 60 s | The window around each purge instant during which the tables being purged refuse sync |
-| `max_skew` | 5 s | Refuse peers believed to be more than this far out of clock |
+| `max_skew` | 5 s | Refuse a peer whose clock is more than this far out, with `CLOCK_SKEW` |
+| `as_of_tolerance` | 1 s | How far the two sides' chosen comparison depths may differ before the client reports adopting the server's |
 | `max_message_bytes` | 4 MiB | The soft budget one protocol message may occupy |
 | `max_rounds_per_session` | 1000 | Round trips before a session ends with a retryable `SESSION_LIMIT` |
+| `max_tree_buckets` | 0 (off) | A tripwire on the number of buckets in the tree. Zero disables it |
 | `write_mode` | `Enforced` | Which trigger dialect is in use |
 | `audit` | `false` | Record which peer applied which row, in `_sync_audit` |
 | `cache` | see below | Read-through cache limits |
@@ -194,6 +216,14 @@ usually within a second or two; refusing peers at a one-second threshold rejects
 sessions that would have been perfectly ordered. 5 s is still far below the granularity
 that matters for LWW here, and it is a **local** threshold: two nodes may disagree about
 it without breaking anything.
+
+`as_of_tolerance` is a different knob and a different kind of check. `max_skew` is
+about the **clock** — two nodes disagreeing about what time it is, which is refused
+with `CLOCK_SKEW` because no negotiation fixes it. `as_of_tolerance` is about the
+**comparison depth** — the two sides choosing how deep to compare — where the server's
+choice simply wins and the client adopts it. There is nothing to fix and nothing to
+refuse; the tolerance only decides when the client reports having adopted the server's
+depth rather than quietly doing it.
 
 `max_message_bytes` and `max_rounds_per_session` are local too. They bound what this
 node is willing to send or receive in one message or one session; the peer answers with
@@ -259,6 +289,9 @@ pub enum KeyStrategy {
     Derived {
         identity_columns: Vec<String>,
         prefix: Option<String>,
+        /// The UUIDv5 namespace. `None` derives it per table from the table name
+        /// and `epoch_us` — stable within a deployment, different between them.
+        namespace: Option<Uuid>,
     },
 
     /// Owner-namespaced: the row's site is part of the key.

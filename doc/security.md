@@ -35,6 +35,9 @@ pub struct Peer {
     pub role:      Role,
     pub endpoint:  String,           // https://…
     pub auth:      PeerAuth,
+
+    /// Overrides the role→profile mapping for this peer. `None` uses the mapping.
+    pub profile:   Option<String>,
 }
 ```
 
@@ -262,8 +265,11 @@ The profile rule must hold at every point where data leaves the node:
    error message, not in a `SELECT`.
 2. **Table list.** Tables excluded by the profile are absent from the session entirely,
    so their existence and shape are not advertised.
-3. **Handshake.** A peer that requests a column outside its profile is rejected with
-   `COLUMN_NOT_PERMITTED`.
+3. **Handshake.** A peer that requests a column outside its profile is refused with
+   `COLUMN_NOT_PERMITTED` — **the request, not the session**. The column is dropped from
+   the projection and the request is logged, and the session continues. A peer asking
+   for a column it may not see is making a mistake, not mounting an attack; the
+   projection is the server's to decide. See [protocol.md](protocol.md) § "Validation".
 4. **The digest seed.** Never sent to a client. Without it, a client cannot compute or
    verify any digest.
 5. **The read cache.** The cache holds full rows including restricted columns, but it is

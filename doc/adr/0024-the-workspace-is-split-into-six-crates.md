@@ -97,10 +97,11 @@ pub fn validate_handshake(local: &LocalView, peer: &Hello) -> Result<Hello>;
 ```
 
 `LocalView` is the set of facts the rules need — the epoch, the codec version, the two
-hashes, the retention and purge schedule, the known peers, the last sync instant.
-`core` gathers it from the database and calls the function. The rules themselves need
-no database, so they are unit-testable in isolation and are the same code on both sides
-of a session.
+hashes, the retention and purge schedule, the known peers, the last sync instant, the
+digest seed verifier, the expected credential, the transport-authenticated identity and
+the skew tolerance. `core` gathers it from the database and passes it in. The rules
+themselves need no database, so they are unit-testable in isolation and are the same
+code on both sides of a session.
 
 The crate also owns **the traits the session needs from the engine**, which `core`
 implements, and **the `Transport` trait**, which the application implements. That
