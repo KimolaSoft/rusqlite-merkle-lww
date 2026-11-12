@@ -1,0 +1,13 @@
+[package]
+name = "merkle-lww-model"
+description = "The vocabulary of merkle-lww: config, values, the canonical encoding, the digest, the schema and visibility hashes, the merge rules, time, and the error codes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "merkle-lww-core"
+description = "The engine of merkle-lww over SQLite: the store, the triggers, the log, the bucket tree, the diff, the session, and the lifecycle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+merkle-lww-model.workspace = true
+merkle-lww-protocol.workspace = true
+serde.workspace = true

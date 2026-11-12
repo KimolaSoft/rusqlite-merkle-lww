@@ -31,8 +31,9 @@ See [ADR-0024](../doc/adr/0024-the-workspace-is-split-into-six-crates.md).
 
 | Module | Holds |
 |---|---|
-| `config.rs` | `SyncConfig`, `TableSpec`, `ColumnSpec`, `ColumnType`, `KeyStrategy`, `Visibility`, `TableKind`, `MergeMode`, `MergePolicy`, `WriteAuthority`, `Peer`, `PeerAuth`, `CacheConfig`, `Role`, `WriteMode`, `AllocationSpec`, `SecretString` |
-| `merge.rs` | `MergePolicy`, `MergePolicyFn`, `MergeContext`, `MergeDecision`, the write-authority rule |
+| `config.rs` | `SyncConfig`, `TableSpec`, `ColumnSpec`, `ColumnType`, `KeyStrategy`, `Visibility`, `TableKind`, `MergeMode`, `MergePolicy`, `WriteAuthority`, `Peer`, `PeerAuth`, `CacheConfig`, `Role`, `WriteMode`, `AllocationSpec`, `SecretString`, `Uuid` |
+| `value.rs` | `Value` — the five SQLite storage classes |
+| `merge.rs` | `MergePolicyFn`, `MergeContext`, `MergeDecision`, `RejectReason`, `Row`, the write-authority rule |
 | `visibility.rs` | `VisibilityProfile`, `ProfileTable`, the projection resolver, the `visibility_hash` |
 | `codec.rs` | the canonical encoding, the seeded xxh3 digest, the two-level `row_hash`, the codec version |
 | `schema.rs` | the `schema_hash` |
@@ -41,18 +42,37 @@ See [ADR-0024](../doc/adr/0024-the-workspace-is-split-into-six-crates.md).
 
 Everything here is `serde`-derived with `Default`.
 
+**`MergePolicy` and `WriteAuthority` are configuration and live in `config.rs`.**
+`merge.rs` holds the *rule* — the trait an application implements, the context it
+is given, the decision it returns — and the rule that evaluates write authority.
+`Value` has a module of its own because the storage class is a vocabulary concern:
+the canonical encoding needs it, the digest needs it, and a merge policy needs it,
+and none of those three should have to define it.
+
+**Two modules are staged.** `merge.rs` and `visibility.rs` are *started* by M1 with
+their shapes — the types, so that `config.rs` can refer to them — and are *completed*
+by M4 and M3 respectively, which add the rules. A module is not introduced twice;
+it is finished twice.
+
 ---
 
 ## M1 — Types, errors and time
+
+**Status: done.**
 
 ### Deliverables
 
 - `config.rs`: every configuration type in the table above, `serde`-derived with
   `Default`.
+- `value.rs`: `Value` — the five SQLite storage classes, as one type.
 - `error.rs`: the error type, including the error codes.
 - `SecretString`: a wrapper whose `Debug` does not print its contents.
+- `Uuid`: the 128-bit identifier, defined here rather than pulled in — see
+  [ADR-0025](../doc/adr/0025-the-model-crate-defines-its-own-uuid-type.md).
 - `time.rs`: RFC 3339 parsing and formatting at fixed six-digit precision; the
   monotonic issuance guard.
+- The **shapes** of `merge.rs` and `visibility.rs` — the types `config.rs` refers to.
+  M3 and M4 complete them with their rules.
 
 ### Notes
 
@@ -63,6 +83,14 @@ Everything here is `serde`-derived with `Default`.
   marker, and it is the type every configuration field that can carry a credential
   uses. The audit — that no credential appears in a log line or an error message — is
   the [CLI](cli.md)'s exit criterion, because that is where the output is.
+- **`SecretString` compares in constant time.** A peer credential is compared against a
+  presented value, and a comparison that leaks its length or its first differing byte
+  is a comparison an attacker can grind.
+- **A custom merge policy is code, not configuration.** `MergePolicy::Custom` is
+  named in a config file, but it cannot be reconstructed from one: deserialising it is
+  an error, and an application installs it in code. The alternative — a config file
+  that names a policy the process does not have — is a deployment that fails at the
+  worst possible moment.
 - **Timestamps are microseconds, always.** The canonical form is RFC 3339 with exactly
   six fractional digits, so the lexicographic order of two formatted timestamps is
   their chronological order. That property is load-bearing: the Merkle buckets are
@@ -70,16 +98,25 @@ Everything here is `serde`-derived with `Default`.
   silently misplace rows.
 - **The monotonic issuance guard** issues a timestamp strictly greater than the last
   one issued anywhere in the process, so two writes in the same microsecond still order
-  deterministically.
+  deterministically. It is a guard and not a clock: it never moves time forward on its
+  own, and a clock that goes backwards does not take a timestamp with it.
+- **The wire spellings are pinned here, because the types that carry them live here.**
+  `Role`, `ColumnType`, `Visibility`, `TableKind` and `WriteAuthority` are declared in
+  `protocol.md` § "Message encoding", and their `serde` attributes are what make them
+  match. A test asserts each shape, so a change to the wire contract shows up as a
+  failing test rather than as a diff in a message nobody reads.
 
 ### Exit criteria
 
-- `cargo clippy` is clean.
+- `cargo clippy` is clean. ✅
 - Timestamps round-trip through parse and format at fixed six-digit precision, and sort
-  lexicographically in chronological order.
-- `SecretString`'s `Debug` output contains no part of the secret.
+  lexicographically in chronological order. ✅
+- `SecretString`'s `Debug` output contains no part of the secret. ✅
 - Every configuration type round-trips through `serde` — a `Default` value serialises and
-  deserialises to itself. This is what makes a config file round-trippable.
+  deserialises to itself. This is what makes a config file round-trippable. ✅
+- **The crate builds with no dependency other than `serde`.** Checkable with
+  `cargo tree -p merkle-lww-model --edges normal`. ✅
+- `cargo publish --dry-run` packages the crate cleanly. ✅
 
 ---
 

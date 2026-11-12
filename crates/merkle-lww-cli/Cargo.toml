@@ -1,0 +1,15 @@
+[package]
+name = "merkle-lww-cli"
+description = "The merkle-lww binary: serve, pull, push, inspect, tree, and verify."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "merkle-lww"
+path = "src/main.rs"
+
+[dependencies]
+merkle-lww-model.workspace = true
+serde.workspace = true

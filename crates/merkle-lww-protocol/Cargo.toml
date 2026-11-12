@@ -1,0 +1,11 @@
+[package]
+name = "merkle-lww-protocol"
+description = "The wire contract of merkle-lww: the message types, the tagged value form, the handshake rules, the engine traits, and the Transport trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+merkle-lww-model.workspace = true
+serde.workspace = true

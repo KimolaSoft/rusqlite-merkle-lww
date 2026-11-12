@@ -117,6 +117,7 @@ sync invariants are enforced inside SQLite rather than by wrapping SQL.
 | [0022](adr/0022-one-purge-instant-per-window.md) | One purge instant per window, and a deployment-wide purge offset |
 | [0023](adr/0023-json-wire-format-and-transport-compression.md) | JSON is the wire format; compression is a transport concern |
 | [0024](adr/0024-the-workspace-is-split-into-six-crates.md) | The workspace is split into six crates |
+| [0025](adr/0025-the-model-crate-defines-its-own-uuid-type.md) | The model crate defines its own `Uuid` type |
 
 ## Conventions used throughout
 

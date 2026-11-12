@@ -1,0 +1,13 @@
+[package]
+name = "merkle-lww-axum"
+description = "The transport of merkle-lww: REST, WebSocket, progress, and compression."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+merkle-lww-model.workspace = true
+merkle-lww-protocol.workspace = true
+merkle-lww-core.workspace = true
+serde.workspace = true

@@ -390,8 +390,9 @@ rusqlite-merkle-lww/
 │   ├── merkle-lww-model/
 │   │   └── src/
 │   │       ├── lib.rs
-│   │       ├── config.rs      # SyncConfig, TableSpec, Peer, CacheConfig
-│   │       ├── merge.rs       # MergePolicy, MergePolicyFn, WriteAuthority
+│   │       ├── config.rs      # SyncConfig, TableSpec, Peer, CacheConfig, Uuid
+│   │       ├── value.rs       # Value — the five SQLite storage classes
+│   │       ├── merge.rs       # MergePolicyFn, MergeContext, MergeDecision
 │   │       ├── visibility.rs  # VisibilityProfile, projections, visibility_hash
 │   │       ├── codec.rs       # canonical encoding, digest, seeded xxh3
 │   │       ├── schema.rs      # schema_hash

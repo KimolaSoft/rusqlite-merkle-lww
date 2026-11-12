@@ -379,6 +379,20 @@ produce the same decision on every peer. See
 [data-model.md](data-model.md) § "Merge policies" for the rules, and
 [adr/0015](adr/0015-per-table-merge-policies-and-write-authority.md) for the reasoning.
 
+**A custom policy is code, not configuration.** `MergePolicy::Custom` is *named* in a
+config file — `"Custom"` — and it cannot be reconstructed from one: deserialising it is
+an error, and an application installs the policy in code. The alternative — a config
+file that names a policy the running process does not have — is a deployment that fails
+at the worst possible moment, and silently falls back to the default rule if the
+fallback is forgiving. `MergePolicy::LastWriteWins` round-trips normally, and it is
+the default.
+
+**The `Uuid` type is the crate's own.** `node_id` and `namespace` are 128-bit
+identifiers defined in `merkle-lww-model`, not pulled in from a UUID library, so that
+the compatibility surface depends on `serde` and nothing else. The text form is the
+hyphenated lowercase one. See
+[adr/0025](adr/0025-the-model-crate-defines-its-own-uuid-type.md).
+
 ### Managed column names
 
 The four crate-owned columns can be renamed per table, for tables whose existing schema

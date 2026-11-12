@@ -37,6 +37,7 @@ invariants are enforced inside SQLite rather than by wrapping SQL — the answer
 | [0022](0022-one-purge-instant-per-window.md) | One purge instant per window, and a deployment-wide purge offset | accepted |
 | [0023](0023-json-wire-format-and-transport-compression.md) | JSON is the wire format; compression is a transport concern | accepted |
 | [0024](0024-the-workspace-is-split-into-six-crates.md) | The workspace is split into six crates | accepted |
+| [0025](0025-the-model-crate-defines-its-own-uuid-type.md) | The model crate defines its own `Uuid` type | accepted |
 
 ## Status values
 

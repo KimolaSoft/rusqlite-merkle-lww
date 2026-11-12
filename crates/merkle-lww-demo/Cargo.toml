@@ -1,0 +1,14 @@
+[package]
+name = "merkle-lww-demo"
+description = "The conformance harness of merkle-lww: the in-memory transport, the scripted clock, and the two-node fixture."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+merkle-lww-model.workspace = true
+merkle-lww-protocol.workspace = true
+merkle-lww-core.workspace = true
+serde.workspace = true
